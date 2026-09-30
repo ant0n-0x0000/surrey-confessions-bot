@@ -31,9 +31,9 @@ export default async function handler(req, res) {
         messages: [
           {
             role: "system",
-            content: "You are a content moderator. Output a JSON object with one key: 'is_safe' (boolean: false if the text contains severe bullying, names of non-public students, self-harm, or severe hate speech. True otherwise)."
+            content: "You are the gatekeeper for a university confessions page. Output a JSON object with exactly one key: 'is_safe' (boolean). Set 'is_safe' to true for genuine confessions, observations, or complaints. You MUST ALLOW profanity, vulgarity, and NSFW themes. Set 'is_safe' to false ONLY if the text contains: 1) severe bullying, hate speech, or self-harm, 2) names of students unless the text is positive, 3) blatant self-promotion or spam, or 4) meaningless gibberish and extreme low-effort 'brain rot'."
           },
-          { role: "user", content: text } // Only the user's text is sent!
+          { role: "user", content: text } 
         ]
       })
     });
