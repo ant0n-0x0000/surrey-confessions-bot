@@ -1,21 +1,54 @@
 export default async function handler(req, res) {
-  // 1. Security check
+  // 1. Security Check
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
   try {
-    // 2. Grab the safe text
-    const { text } = req.body;
+    // 2. Extract ONLY the confession text from Tally's massive webhook
+    const tallyData = req.body;
+    
+    // This digs through the JSON structure you provided to find the exact text
+    const text = tallyData?.data?.fields?.[0]?.value;
 
     if (!text) {
-      return res.status(400).json({ error: 'No text provided in the webhook payload' });
+      // Return a 200 OK so Tally accepts the initial setup ping
+      return res.status(200).json({ message: 'Webhook received, but no confession text found (likely a test ping).' });
     }
 
-    // 3. Double-encode for Cloudinary
-    const safeText = encodeURIComponent(encodeURIComponent(text));
+    // 3. Ask OpenAI if the text is safe (Saving tokens because we only send the text!)
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    
+    const aiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: "You are a content moderator. Output a JSON object with one key: 'is_safe' (boolean: false if the text contains severe bullying, names of non-public students, self-harm, or severe hate speech. True otherwise)."
+          },
+          { role: "user", content: text } // Only the user's text is sent!
+        ]
+      })
+    });
+    
+    const aiData = await aiResponse.json();
+    const moderation = JSON.parse(aiData.choices[0].message.content);
 
-    // 4. Build the final Cloudinary URL
+    // 4. The Kill Switch
+    if (moderation.is_safe === false) {
+      // The script stops here. We return a 200 success so Tally knows the webhook was received.
+      return res.status(200).json({ success: true, message: "Blocked by AI." });
+    }
+
+    // 5. Cloudinary Image Generation
+    const safeText = encodeURIComponent(encodeURIComponent(text));
     const cloudName = "hff7fini";
     const backgroundName = "surrey_background.jpg"; 
     
@@ -25,34 +58,19 @@ export default async function handler(req, res) {
       `r_30/fl_layer_apply/` +
       `${backgroundName}`;
 
-    // 5. Retrieve your Discord Webhook URL from Vercel
+    // 6. Send to Discord
     const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-
-    if (!DISCORD_WEBHOOK_URL) {
-      throw new Error('Missing DISCORD_WEBHOOK_URL in Vercel Environment Variables');
-    }
-
-    // 6. Send the text and image preview to Discord
-    const discordResponse = await fetch(DISCORD_WEBHOOK_URL, {
+    
+    await fetch(DISCORD_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         content: `🟢 **New Confession Passed Moderation!**\n> ${text}`,
-        embeds: [{
-          image: { url: imageUrl }
-        }]
+        embeds: [{ image: { url: imageUrl } }]
       })
     });
 
-    if (!discordResponse.ok) {
-      throw new Error(`Discord API Error: ${discordResponse.statusText}`);
-    }
-
-    // 7. Tell IFTTT the process was a complete success
-    return res.status(200).json({ 
-      success: true, 
-      cloudinaryUrl: imageUrl 
-    });
+    return res.status(200).json({ success: true, cloudinaryUrl: imageUrl });
 
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
