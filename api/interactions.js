@@ -3,6 +3,7 @@ import { verifyKey } from 'discord-interactions';
 import getRawBody from 'raw-body';
 import { createHash, randomUUID } from 'node:crypto';
 import { publishInstagramPosts } from '../lib/instagram.js';
+import { waitUntil } from '@vercel/functions';
 
 export const config = {
   api: {
@@ -174,7 +175,15 @@ async function handleComponent(
     customId.startsWith('stage_') ||
     customId.startsWith('post_')
   ) {
-    return await handleModerationButton(
+    return handleModerationButton(
+      interaction,
+      res
+    );
+  }
+
+  // Publish the complete staged queue.
+  if (customId === 'staged_post') {
+    return handleStagedPublish(
       interaction,
       res
     );
@@ -227,20 +236,35 @@ async function handleComponent(
    EXISTING MODERATION BUTTONS
    ============================================================ */
 
-async function handleModerationButton(
+function handleModerationButton(
   interaction,
   res
 ) {
-  // Acknowledge the button immediately.
+  // Explicitly keep the post-acknowledgement work alive on Vercel.
+  // Without waitUntil(), work started after the Discord response can be
+  // cut off when the serverless invocation finishes its HTTP response.
+  waitUntil(
+    processModerationButton(interaction)
+  );
+
   res.status(200).json({
     type: 6,
   });
+}
 
+async function processModerationButton(
+  interaction
+) {
   const customId =
     interaction.data.custom_id;
 
   const [action, uniqueId] =
     customId.split('_');
+
+  console.log(
+    '[Moderation] Processing button:',
+    action
+  );
 
   let redis;
 
@@ -511,22 +535,29 @@ async function handleModerationButton(
    PUBLISH STAGED POSTS
    ============================================================ */
 
-async function handleStagedPublish(
+function handleStagedPublish(
   interaction,
   res
 ) {
   /*
-   * Acknowledge the button immediately. Publishing can require
-   * multiple Meta API requests and must not exceed Discord's
-   * initial interaction response window.
+   * Acknowledge the button immediately while explicitly keeping the
+   * longer publishing operation alive on Vercel.
    */
-  res.status(200).json({
-    type: 5,
+  waitUntil(
+    processStagedPublish(interaction)
+  );
 
-    data: {
-      flags: 64,
-    },
+  res.status(200).json({
+    type: 6,
   });
+}
+
+async function processStagedPublish(
+  interaction
+) {
+  console.log(
+    '[Instagram] Processing staged publish button.'
+  );
 
   let redis;
 
