@@ -5,5 +5,8 @@
     "ioredis": "^5.3.2",
     "discord-interactions": "^4.1.0",
     "raw-body": "^2.5.2"
+  },
+  "scripts": {
+    "register-command": "node scripts_register_commands.cjs"
   }
 }
