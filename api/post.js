@@ -72,7 +72,7 @@ export default async function handler(req, res) {
 
         body: JSON.stringify({
           content:
-            `🟡 **New Confession**\n> ${text}`,
+            `🟡 **New Confession** <@145224646868860928>\n> ${text}`,
 
           embeds: [
             {
