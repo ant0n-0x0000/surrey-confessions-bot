@@ -1,22 +1,12 @@
 import Redis from 'ioredis';
 import { verifyKey } from 'discord-interactions';
+import getRawBody from 'raw-body';
 
-// Tell Vercel NOT to parse the body automatically
 export const config = {
   api: {
     bodyParser: false,
   },
 };
-
-// A rock-solid helper to manually read the raw stream for signature verification
-async function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
-    req.on('end', () => resolve(body));
-    req.on('error', reject);
-  });
-}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -24,10 +14,11 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. Get raw body
-    const rawBody = await getRawBody(req);
+    // 1. Safely grab the raw body using the standard library
+    const rawBodyBuffer = await getRawBody(req);
+    const rawBody = rawBodyBuffer.toString('utf8');
     
-    // 2. Fetch headers & key (adding .trim() just in case Vercel added a hidden space)
+    // 2. Fetch headers & key
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
     const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY?.trim();
@@ -45,7 +36,7 @@ export default async function handler(req, res) {
 
     const interaction = JSON.parse(rawBody);
 
-    // 4. Handle PING (Type 1) - The exact format Discord demands
+    // 4. Handle PING (Type 1)
     if (interaction.type === 1) {
       res.setHeader('Content-Type', 'application/json');
       return res.status(200).send(JSON.stringify({ type: 1 }));
@@ -53,7 +44,6 @@ export default async function handler(req, res) {
 
     // 5. Handle Buttons (Type 3)
     if (interaction.type === 3) {
-      // Instantly tell Discord we are processing it so it doesn't time out
       res.setHeader('Content-Type', 'application/json');
       res.status(200).send(JSON.stringify({ type: 6 })); 
 
@@ -72,7 +62,6 @@ export default async function handler(req, res) {
       } else if (action === 'stage') {
         const confessionData = await redis.get(`conf_${uniqueId}`);
         if (confessionData) {
-          // Push to the staging queue
           await redis.rpush('staged_posts', confessionData);
           await redis.del(`conf_${uniqueId}`); 
           
@@ -84,7 +73,7 @@ export default async function handler(req, res) {
           });
         } else {
             await editDiscordMessage(interaction.token, {
-                content: `⚠️ **Error:** Confession expired or was already staged.`,
+                content: `⚠️️ **Error:** Confession expired or was already staged.`,
                 components: [] 
               });
         }
