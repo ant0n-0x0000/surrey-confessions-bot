@@ -20,6 +20,12 @@ const STAGED_PUBLISH_LOCK_KEY = 'staged_publish_lock';
 const STAGED_PUBLISH_LOCK_TTL_SECONDS = 300;
 const STAGED_LAST_PUBLISH_KEY = 'staged_last_publish';
 
+const INSTAGRAM_REQUIRED_HASHTAGS =
+  '#uniofsurrey #guildford #mysurrey #surrey #surreynotsorry';
+
+const MAX_INSTAGRAM_CAPTION_LENGTH = 2200;
+const DISCORD_CAPTION_INPUT_ID = 'instagram_caption';
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).send('Method Not Allowed');
@@ -87,6 +93,14 @@ export default async function handler(req, res) {
     // Buttons and select menus.
     if (interaction.type === 3) {
       return await handleComponent(
+        interaction,
+        res
+      );
+    }
+
+    // Modal submissions.
+    if (interaction.type === 5) {
+      return await handleModalSubmit(
         interaction,
         res
       );
@@ -169,11 +183,19 @@ async function handleComponent(
     );
   }
 
-  // Existing moderation buttons.
+  // Post Now opens a caption modal before publishing.
+  if (customId.startsWith('post_')) {
+    return showCaptionModal(
+      interaction,
+      res,
+      'post'
+    );
+  }
+
+  // Stage and Delete keep their existing immediate behaviour.
   if (
     customId.startsWith('delete_') ||
-    customId.startsWith('stage_') ||
-    customId.startsWith('post_')
+    customId.startsWith('stage_')
   ) {
     return handleModerationButton(
       interaction,
@@ -181,11 +203,12 @@ async function handleComponent(
     );
   }
 
-  // Publish the complete staged queue.
+  // Publish the complete staged queue after collecting a caption.
   if (customId === 'staged_post') {
-    return handleStagedPublish(
+    return showCaptionModal(
       interaction,
-      res
+      res,
+      'staged'
     );
   }
 
@@ -228,6 +251,216 @@ async function handleComponent(
 
   return res.status(400).send(
     'Unknown component'
+  );
+}
+
+
+/* ============================================================
+   INSTAGRAM CAPTION MODALS
+   ============================================================ */
+
+function showCaptionModal(
+  interaction,
+  res,
+  mode
+) {
+  const customId =
+    interaction.data?.custom_id;
+
+  let modalId;
+
+  if (mode === 'post') {
+    const uniqueId =
+      customId?.slice('post_'.length);
+
+    if (!uniqueId) {
+      return res.status(400).send(
+        'Invalid Post Now button.'
+      );
+    }
+
+    modalId =
+      `instagram_caption_post_${uniqueId}`;
+  } else {
+    modalId =
+      'instagram_caption_staged';
+  }
+
+  return res.status(200).json({
+    type: 9,
+
+    data: {
+      custom_id: modalId,
+
+      title:
+        'Instagram Caption',
+
+      components: [
+        {
+          type: 1,
+
+          components: [
+            {
+              type: 4,
+
+              custom_id:
+                DISCORD_CAPTION_INPUT_ID,
+
+              label:
+                'Caption (optional)',
+
+              style: 2,
+
+              placeholder:
+                'Write a caption... hashtags are added automatically.',
+
+              required: false,
+
+              max_length: 2141,
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+async function handleModalSubmit(
+  interaction,
+  res
+) {
+  const modalId =
+    interaction.data?.custom_id;
+
+  if (
+    !modalId?.startsWith(
+      'instagram_caption_'
+    )
+  ) {
+    return res.status(400).send(
+      'Unknown modal.'
+    );
+  }
+
+  const captionInput =
+    getModalTextValue(
+      interaction,
+      DISCORD_CAPTION_INPUT_ID
+    );
+
+  const instagramCaption =
+    buildInstagramCaption(
+      captionInput
+    );
+
+  if (
+    instagramCaption.length >
+    MAX_INSTAGRAM_CAPTION_LENGTH
+  ) {
+    return res.status(200).json({
+      type: 4,
+
+      data: {
+        content:
+          `🔴 **Caption is too long.** Please keep your caption under ` +
+          `${2141} characters because the required hashtags are added automatically.`,
+
+        flags: 64,
+      },
+    });
+  }
+
+  if (
+    modalId ===
+    'instagram_caption_staged'
+  ) {
+    waitUntil(
+      processStagedPublish(
+        interaction,
+        instagramCaption
+      )
+    );
+
+    return res.status(200).json({
+      type: 5,
+
+      data: {
+        flags: 64,
+      },
+    });
+  }
+
+  if (
+    modalId.startsWith(
+      'instagram_caption_post_'
+    )
+  ) {
+    const uniqueId =
+      modalId.slice(
+        'instagram_caption_post_'.length
+      );
+
+    if (!uniqueId) {
+      return res.status(400).send(
+        'Invalid Post Now modal.'
+      );
+    }
+
+    waitUntil(
+      processPostNow(
+        interaction,
+        uniqueId,
+        instagramCaption
+      )
+    );
+
+    return res.status(200).json({
+      type: 5,
+
+      data: {
+        flags: 64,
+      },
+    });
+  }
+
+  return res.status(400).send(
+    'Unknown modal.'
+  );
+}
+
+function getModalTextValue(
+  interaction,
+  customId
+) {
+  const rows =
+    interaction.data?.components || [];
+
+  for (const row of rows) {
+    for (const component of row.components || []) {
+      if (component.custom_id === customId) {
+        return component.value || '';
+      }
+    }
+  }
+
+  return '';
+}
+
+function buildInstagramCaption(
+  captionInput
+) {
+  const caption =
+    typeof captionInput === 'string'
+      ? captionInput.trim()
+      : '';
+
+  if (!caption) {
+    return INSTAGRAM_REQUIRED_HASHTAGS;
+  }
+
+  return (
+    `${caption}\n\n` +
+    INSTAGRAM_REQUIRED_HASHTAGS
   );
 }
 
@@ -408,99 +641,6 @@ async function processModerationButton(
       return;
     }
 
-    /*
-     * POST NOW
-     *
-     * Publish this single confession directly to Instagram.
-     * The Redis record is only removed after Meta confirms the
-     * publish request succeeded.
-     */
-    if (action === 'post') {
-      const confessionData =
-        await redis.get(
-          `conf_${uniqueId}`
-        );
-
-      if (!confessionData) {
-        await editDiscordMessage(
-          interaction.token,
-          {
-            content:
-              '⚠️ **Error:** Confession expired or was already handled.',
-
-            embeds: [],
-
-            components: [],
-          }
-        );
-
-        return;
-      }
-
-      let confession;
-
-      try {
-        confession =
-          JSON.parse(
-            confessionData
-          );
-      } catch (error) {
-        throw new Error(
-          'The stored confession data is invalid JSON.'
-        );
-      }
-
-      await editDiscordMessage(
-        interaction.token,
-        {
-          content:
-            '⏳ **Publishing to Instagram...**',
-
-          components: [],
-        }
-      );
-
-      try {
-        await publishInstagramPosts([
-          confession,
-        ]);
-
-        // Only clear the temporary confession after a confirmed publish.
-        await redis.del(
-          `conf_${uniqueId}`
-        );
-
-        await editDiscordMessage(
-          interaction.token,
-          {
-            content:
-              '🟢 **Posted Live to Instagram.**',
-
-            embeds: [],
-
-            components: [],
-          }
-        );
-      } catch (error) {
-        console.error(
-          'Instagram Post Now failed:',
-          error
-        );
-
-        await editDiscordMessage(
-          interaction.token,
-          {
-            content:
-              `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\n` +
-              'The confession was kept so it can be retried.',
-
-            components: [],
-          }
-        );
-      }
-
-      return;
-    }
   } catch (error) {
     console.error(
       'Moderation button failed:',
@@ -532,28 +672,167 @@ async function processModerationButton(
 
 
 /* ============================================================
+   POST NOW
+   ============================================================ */
+
+async function processPostNow(
+  interaction,
+  uniqueId,
+  instagramCaption
+) {
+  console.log(
+    '[Instagram] Processing Post Now with caption.'
+  );
+
+  let redis;
+
+  try {
+    redis = await createRedis();
+
+    const confessionData =
+      await redis.get(
+        `conf_${uniqueId}`
+      );
+
+    if (!confessionData) {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '⚠️ **Error:** Confession expired or was already handled.',
+
+          embeds: [],
+
+          components: [],
+        }
+      );
+
+      return;
+    }
+
+    let confession;
+
+    try {
+      confession =
+        JSON.parse(
+          confessionData
+        );
+    } catch (error) {
+      throw new Error(
+        'The stored confession data is invalid JSON.'
+      );
+    }
+
+    await editDiscordMessage(
+      interaction.token,
+      {
+        content:
+          '⏳ **Publishing to Instagram...**',
+
+        components: [],
+      }
+    );
+
+    try {
+      await publishInstagramPosts(
+        [confession],
+        instagramCaption
+      );
+
+      // Only clear the temporary confession after a confirmed publish.
+      await redis.del(
+        `conf_${uniqueId}`
+      );
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '🟢 **Posted Live to Instagram.**',
+
+          embeds: [],
+
+          components: [],
+        }
+      );
+
+      // Also disable the buttons on the original moderation message.
+      if (
+        interaction.channel_id &&
+        interaction.message?.id
+      ) {
+        try {
+          await editDiscordChannelMessage(
+            interaction.channel_id,
+            interaction.message.id,
+            {
+              content:
+                '🟢 **Posted Live to Instagram.**',
+
+              embeds: [],
+
+              components: [],
+            }
+          );
+        } catch (discordError) {
+          console.error(
+            'Failed to archive the original moderation message after Instagram publish:',
+            discordError
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        'Instagram Post Now failed:',
+        error
+      );
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\n` +
+            'The confession was kept so it can be retried.',
+
+          components: [],
+        }
+      );
+    }
+  } catch (error) {
+    console.error(
+      'Post Now modal failed:',
+      error
+    );
+
+    try {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            `🔴 **Action failed.**\n> ${formatInstagramError(error)}\n\nPlease try again in a moment.`,
+
+          components: [],
+        }
+      );
+    } catch (discordError) {
+      console.error(
+        'Failed to update Discord after Post Now modal error:',
+        discordError
+      );
+    }
+  } finally {
+    closeRedis(redis);
+  }
+}
+
+
+/* ============================================================
    PUBLISH STAGED POSTS
    ============================================================ */
 
-function handleStagedPublish(
-  interaction,
-  res
-) {
-  /*
-   * Acknowledge the button immediately while explicitly keeping the
-   * longer publishing operation alive on Vercel.
-   */
-  waitUntil(
-    processStagedPublish(interaction)
-  );
-
-  res.status(200).json({
-    type: 6,
-  });
-}
-
 async function processStagedPublish(
-  interaction
+  interaction,
+  instagramCaption
 ) {
   console.log(
     '[Instagram] Processing staged publish button.'
@@ -619,7 +898,8 @@ async function processStagedPublish(
      */
     const queueFingerprint =
       createStagedQueueFingerprint(
-        stagedPosts
+        stagedPosts,
+        instagramCaption
       );
 
     const lastPublished =
@@ -663,7 +943,8 @@ async function processStagedPublish(
 
     const publishResult =
       await publishInstagramPosts(
-        stagedPosts
+        stagedPosts,
+        instagramCaption
       );
 
     /*
@@ -1056,15 +1337,17 @@ async function releaseStagedPublishLock(
 }
 
 function createStagedQueueFingerprint(
-  stagedPosts
+  stagedPosts,
+  instagramCaption
 ) {
   return createHash(
     'sha256'
   )
     .update(
-      JSON.stringify(
-        stagedPosts
-      )
+      JSON.stringify({
+        stagedPosts,
+        instagramCaption,
+      })
     )
     .digest('hex');
 }
@@ -1491,6 +1774,52 @@ function truncateText(
 /* ============================================================
    DISCORD API
    ============================================================ */
+
+
+async function editDiscordChannelMessage(
+  channelId,
+  messageId,
+  data
+) {
+  const botToken =
+    process.env.DISCORD_BOT_TOKEN;
+
+  if (!botToken) {
+    throw new Error(
+      'DISCORD_BOT_TOKEN is not configured.'
+    );
+  }
+
+  const response =
+    await fetch(
+      `https://discord.com/api/v10/channels/` +
+        `${channelId}/messages/${messageId}`,
+      {
+        method: 'PATCH',
+
+        headers: {
+          'Content-Type':
+            'application/json',
+
+          Authorization:
+            `Bot ${botToken}`,
+        },
+
+        body: JSON.stringify(data),
+      }
+    );
+
+  if (!response.ok) {
+    const responseText =
+      await response.text();
+
+    throw new Error(
+      `Discord channel message edit failed ` +
+        `(${response.status}): ` +
+        responseText
+    );
+  }
+}
 
 async function editDiscordMessage(
   interactionToken,
