@@ -1,0 +1,8 @@
+{
+  "name": "surrey-confessions",
+  "version": "1.0.0",
+  "dependencies": {
+    "@vercel/kv": "^3.0.0",
+    "discord-interactions": "^4.1.0"
+  }
+}
