@@ -1,8 +1,7 @@
-import { kv } from '@vercel/kv';
+import Redis from 'ioredis';
 import { verifyKey } from 'discord-interactions';
 
-// CRITICAL FIX: Tell Vercel NOT to parse the JSON body automatically.
-// We need the raw text stream to mathematically verify Discord's signature.
+// Tell Vercel NOT to parse the JSON body automatically so we can verify the signature.
 export const config = {
   api: {
     bodyParser: false,
@@ -37,24 +36,27 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: 'Bad request signature' });
     }
 
-    // 3. Now that it's verified, we can safely parse the JSON
+    // 3. Setup Redis connection
+    const redis = new Redis(process.env.REDIS_URL);
+
+    // 4. Safely parse the JSON
     const interaction = JSON.parse(rawBody);
 
-    // 4. Handle Discord's initial PING request (required for setup)
+    // 5. Handle Discord's PING
     if (interaction.type === 1) {
-      return res.status(200).json({ type: 1 }); // Respond with PONG (Type 1)
+      return res.status(200).json({ type: 1 });
     }
 
-    // 5. Handle Button Clicks (Type 3)
+    // 6. Handle Button Clicks
     if (interaction.type === 3) {
       const customId = interaction.data.custom_id;
       const [action, uniqueId] = customId.split('_'); 
       
-      // Tell Discord we received the click and are processing it
+      // Tell Discord we are processing the click
       res.status(200).json({ type: 6 }); 
 
       if (action === 'delete') {
-        await kv.del(`conf_${uniqueId}`);
+        await redis.del(`conf_${uniqueId}`);
         await editDiscordMessage(interaction.token, {
           content: '🔴 **Deleted and Archived.**',
           embeds: [], 
@@ -62,18 +64,24 @@ export default async function handler(req, res) {
         });
 
       } else if (action === 'stage') {
-        const confessionData = await kv.get(`conf_${uniqueId}`);
+        const confessionData = await redis.get(`conf_${uniqueId}`);
         if (confessionData) {
-          // Note: kv.get automatically parses JSON in ioredis/vercel-kv, so we stringify it again for the list
-          await kv.rpush('staged_posts', typeof confessionData === 'string' ? confessionData : JSON.stringify(confessionData));
-          await kv.del(`conf_${uniqueId}`); 
+          // Push to the staging list and clean up the temporary record
+          await redis.rpush('staged_posts', confessionData);
+          await redis.del(`conf_${uniqueId}`); 
           
-          const queueLength = await kv.llen('staged_posts');
+          const queueLength = await redis.llen('staged_posts');
 
           await editDiscordMessage(interaction.token, {
             content: `🟡 **Staged.** (Current Queue: ${queueLength}/10)`,
             components: [] 
           });
+        } else {
+            // Handle edge case where data expired or was already staged
+            await editDiscordMessage(interaction.token, {
+                content: `⚠️ **Error:** Confession data no longer exists in database.`,
+                components: [] 
+              });
         }
       } else if (action === 'post') {
          await editDiscordMessage(interaction.token, {
@@ -84,7 +92,6 @@ export default async function handler(req, res) {
     }
   } catch (error) {
     console.error("Error processing interaction:", error);
-    // If we haven't already sent a response, send a 500
     if (!res.headersSent) {
       res.status(500).json({ error: 'Internal Server Error' });
     }
