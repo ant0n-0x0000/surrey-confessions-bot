@@ -31,7 +31,16 @@ export default async function handler(req, res) {
         messages: [
           {
             role: "system",
-            content: "You are the gatekeeper for a university confessions page. Output a JSON object with exactly one key: 'is_safe' (boolean). Set 'is_safe' to true for genuine confessions, observations, or complaints. You MUST ALLOW profanity, vulgarity, and NSFW themes. Set 'is_safe' to false ONLY if the text contains: 1) severe bullying, hate speech, or self-harm, 2) names of students unless the meaning of the message is positive, 3) blatant self-promotion or spam, or 4) meaningless gibberish and extreme low-effort 'brain rot'."
+            content: `You are the strict gatekeeper for a university confessions page. Output a JSON object with exactly one key: 'is_safe' (boolean).
+
+ALLOW: General complaints, profanity, vulgarity, and NSFW themes. 
+
+BLOCK (Set is_safe to false) if the text violates ANY of these strict rules:
+1. FULL NAMES: Any use of a full name (first and last name together) is strictly forbidden, regardless of context (even positive ones).
+2. TARGETED HARASSMENT: Any negative, insulting, or bullying statement directed at a specific person. (e.g., "[Name] is a shithead" MUST be blocked). While general profanity is allowed, targeted profanity using a name is bullying.
+3. NEGATIVE USE OF FIRST NAMES: First names or initials are ONLY allowed in strictly positive, harmless, or romantic contexts (e.g., a crush). If a first name is tied to a complaint or insult, block it immediately.
+4. HARM & HATE: Hate speech (racism, homophobia, etc.) or self-harm.
+5. LOW QUALITY: Blatant self-promotion, spam, or meaningless 'brain rot' gibberish.`
           },
           { role: "user", content: text } 
         ]
