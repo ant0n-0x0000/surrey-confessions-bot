@@ -20,48 +20,105 @@ export default async function handler(req, res) {
     const rawBodyBuffer = await getRawBody(req);
     const rawBody = rawBodyBuffer.toString('utf8');
 
-    const signature = req.headers['x-signature-ed25519'];
-    const timestamp = req.headers['x-signature-timestamp'];
-    const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY?.trim();
+    const signature =
+      req.headers['x-signature-ed25519'];
+
+    const timestamp =
+      req.headers['x-signature-timestamp'];
+
+    const PUBLIC_KEY =
+      process.env.DISCORD_PUBLIC_KEY?.trim();
+
+    console.log(
+      'Discord interaction verification:',
+      {
+        bodyLength: rawBody.length,
+        signaturePresent: !!signature,
+        signatureLength: signature?.length || 0,
+        timestampPresent: !!timestamp,
+        timestampLength: timestamp?.length || 0,
+        publicKeyPresent: !!PUBLIC_KEY,
+        publicKeyLength: PUBLIC_KEY?.length || 0,
+      }
+    );
 
     if (!signature || !timestamp || !PUBLIC_KEY) {
-      return res.status(401).send('Missing headers or key');
+      console.error(
+        'Discord verification failed: missing signature, timestamp, or public key.'
+      );
+
+      return res.status(401).send(
+        'Missing headers or key'
+      );
     }
 
-    const isValidRequest = await verifyKey(
-      rawBody,
-      signature,
-      timestamp,
-      PUBLIC_KEY
+    const isValidRequest =
+      await verifyKey(
+        rawBody,
+        signature,
+        timestamp,
+        PUBLIC_KEY
+      );
+
+    console.log(
+      'Discord signature verification result:',
+      isValidRequest
     );
 
     if (!isValidRequest) {
-      return res.status(401).send('Bad request signature');
+      console.error(
+        'Discord verification failed: invalid signature.'
+      );
+
+      return res.status(401).send(
+        'Bad request signature'
+      );
     }
 
-    const interaction = JSON.parse(rawBody);
+    const interaction =
+      JSON.parse(rawBody);
+
+    console.log(
+      'Discord interaction type:',
+      interaction.type
+    );
 
     // Discord endpoint verification.
     if (interaction.type === 1) {
-      return res.status(200).json({ type: 1 });
+      return res.status(200).json({
+        type: 1,
+      });
     }
 
     // Slash commands.
     if (interaction.type === 2) {
-      return await handleCommand(interaction, res);
+      return await handleCommand(
+        interaction,
+        res
+      );
     }
 
     // Buttons and select menus.
     if (interaction.type === 3) {
-      return await handleComponent(interaction, res);
+      return await handleComponent(
+        interaction,
+        res
+      );
     }
 
-    return res.status(400).send('Unsupported interaction type');
+    return res.status(400).send(
+      'Unsupported interaction type'
+    );
   } catch (error) {
-    console.error('Error processing interaction:', error);
+    console.error(
+      'Error processing interaction:',
+      error
+    );
 
     if (!res.headersSent) {
-      return res.status(500).send('Internal Server Error');
+      return res.status(500).send(
+        'Internal Server Error'
+      );
     }
   }
 }
@@ -71,17 +128,27 @@ export default async function handler(req, res) {
    SLASH COMMANDS
    ============================================================ */
 
-async function handleCommand(interaction, res) {
-  const commandName = interaction.data?.name;
+async function handleCommand(
+  interaction,
+  res
+) {
+  const commandName =
+    interaction.data?.name;
 
   if (commandName === 'staged') {
-    const redis = new Redis(process.env.REDIS_URL);
+    const redis =
+      new Redis(
+        process.env.REDIS_URL
+      );
 
     try {
-      const stagedPosts = await getStagedPosts(redis);
+      const stagedPosts =
+        await getStagedPosts(redis);
 
       return res.status(200).json(
-        createStagedPreviewResponse(stagedPosts)
+        createStagedPreviewResponse(
+          stagedPosts
+        )
       );
     } finally {
       redis.disconnect();
@@ -90,8 +157,11 @@ async function handleCommand(interaction, res) {
 
   return res.status(200).json({
     type: 4,
+
     data: {
-      content: `Unknown command: ${commandName}`,
+      content:
+        `Unknown command: ${commandName}`,
+
       flags: 64,
     },
   });
@@ -102,11 +172,17 @@ async function handleCommand(interaction, res) {
    COMPONENTS
    ============================================================ */
 
-async function handleComponent(interaction, res) {
-  const customId = interaction.data?.custom_id;
+async function handleComponent(
+  interaction,
+  res
+) {
+  const customId =
+    interaction.data?.custom_id;
 
   if (!customId) {
-    return res.status(400).send('Missing component custom_id');
+    return res.status(400).send(
+      'Missing component custom_id'
+    );
   }
 
   // Existing moderation buttons.
@@ -115,27 +191,52 @@ async function handleComponent(interaction, res) {
     customId.startsWith('stage_') ||
     customId.startsWith('post_')
   ) {
-    return await handleModerationButton(interaction, res);
+    return await handleModerationButton(
+      interaction,
+      res
+    );
   }
 
   // Staged-post preview controls.
   if (customId === 'staged_select') {
-    return await handleStagedSelection(interaction, res);
+    return await handleStagedSelection(
+      interaction,
+      res
+    );
   }
 
-  if (customId.startsWith('staged_up_')) {
-    return await handleStagedMove(interaction, res, 'up');
+  if (
+    customId.startsWith('staged_up_')
+  ) {
+    return await handleStagedMove(
+      interaction,
+      res,
+      'up'
+    );
   }
 
-  if (customId.startsWith('staged_down_')) {
-    return await handleStagedMove(interaction, res, 'down');
+  if (
+    customId.startsWith('staged_down_')
+  ) {
+    return await handleStagedMove(
+      interaction,
+      res,
+      'down'
+    );
   }
 
-  if (customId.startsWith('staged_remove_')) {
-    return await handleStagedRemove(interaction, res);
+  if (
+    customId.startsWith('staged_remove_')
+  ) {
+    return await handleStagedRemove(
+      interaction,
+      res
+    );
   }
 
-  return res.status(400).send('Unknown component');
+  return res.status(400).send(
+    'Unknown component'
+  );
 }
 
 
@@ -143,27 +244,46 @@ async function handleComponent(interaction, res) {
    EXISTING MODERATION BUTTONS
    ============================================================ */
 
-async function handleModerationButton(interaction, res) {
+async function handleModerationButton(
+  interaction,
+  res
+) {
   // Acknowledge the button immediately.
-  res.status(200).json({ type: 6 });
+  res.status(200).json({
+    type: 6,
+  });
 
-  const customId = interaction.data.custom_id;
-  const [action, uniqueId] = customId.split('_');
+  const customId =
+    interaction.data.custom_id;
 
-  const redis = new Redis(process.env.REDIS_URL);
+  const [action, uniqueId] =
+    customId.split('_');
+
+  const redis =
+    new Redis(
+      process.env.REDIS_URL
+    );
 
   try {
     /*
      * DELETE
      */
     if (action === 'delete') {
-      await redis.del(`conf_${uniqueId}`);
+      await redis.del(
+        `conf_${uniqueId}`
+      );
 
-      await editDiscordMessage(interaction.token, {
-        content: '🔴 **Deleted and Archived.**',
-        embeds: [],
-        components: [],
-      });
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '🔴 **Deleted and Archived.**',
+
+          embeds: [],
+
+          components: [],
+        }
+      );
 
       return;
     }
@@ -172,14 +292,21 @@ async function handleModerationButton(interaction, res) {
      * STAGE
      */
     if (action === 'stage') {
-      const confessionData = await redis.get(`conf_${uniqueId}`);
+      const confessionData =
+        await redis.get(
+          `conf_${uniqueId}`
+        );
 
       if (!confessionData) {
-        await editDiscordMessage(interaction.token, {
-          content:
-            '⚠️ **Error:** Confession expired or was already staged.',
-          components: [],
-        });
+        await editDiscordMessage(
+          interaction.token,
+          {
+            content:
+              '⚠️ **Error:** Confession expired or was already staged.',
+
+            components: [],
+          }
+        );
 
         return;
       }
@@ -195,43 +322,55 @@ async function handleModerationButton(interaction, res) {
        * because two simultaneous requests could otherwise both see
        * 9 posts and both add one, resulting in 11.
        */
-      const added = await redis.eval(
-        `
-          if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
-            return 0
-          end
+      const added =
+        await redis.eval(
+          `
+            if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+              return 0
+            end
 
-          redis.call('RPUSH', KEYS[1], ARGV[2])
-          return 1
-        `,
-        1,
-        STAGED_POSTS_KEY,
-        MAX_STAGED_POSTS,
-        confessionData
-      );
+            redis.call('RPUSH', KEYS[1], ARGV[2])
+            return 1
+          `,
+          1,
+          STAGED_POSTS_KEY,
+          MAX_STAGED_POSTS,
+          confessionData
+        );
 
       if (!added) {
-        await editDiscordMessage(interaction.token, {
-          content:
-            `🔴 **Staging queue is full (${MAX_STAGED_POSTS}/${MAX_STAGED_POSTS}).**`,
-          components: [],
-        });
+        await editDiscordMessage(
+          interaction.token,
+          {
+            content:
+              `🔴 **Staging queue is full (${MAX_STAGED_POSTS}/${MAX_STAGED_POSTS}).**`,
+
+            components: [],
+          }
+        );
 
         return;
       }
 
       // Only delete the temporary confession once staging succeeded.
-      await redis.del(`conf_${uniqueId}`);
-
-      const queueLength = await redis.llen(
-        STAGED_POSTS_KEY
+      await redis.del(
+        `conf_${uniqueId}`
       );
 
-      await editDiscordMessage(interaction.token, {
-        content:
-          `🟡 **Staged.** (Current Queue: ${queueLength}/${MAX_STAGED_POSTS})`,
-        components: [],
-      });
+      const queueLength =
+        await redis.llen(
+          STAGED_POSTS_KEY
+        );
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            `🟡 **Staged.** (Current Queue: ${queueLength}/${MAX_STAGED_POSTS})`,
+
+          components: [],
+        }
+      );
 
       return;
     }
@@ -243,10 +382,15 @@ async function handleModerationButton(interaction, res) {
      * We'll replace this with the Graph API posting logic later.
      */
     if (action === 'post') {
-      await editDiscordMessage(interaction.token, {
-        content: '🟢 **Posted Live.**',
-        components: [],
-      });
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '🟢 **Posted Live.**',
+
+          components: [],
+        }
+      );
     }
   } finally {
     redis.disconnect();
@@ -258,28 +402,47 @@ async function handleModerationButton(interaction, res) {
    STAGED POST SELECTION
    ============================================================ */
 
-async function handleStagedSelection(interaction, res) {
-  const selectedValue = interaction.data?.values?.[0];
+async function handleStagedSelection(
+  interaction,
+  res
+) {
+  const selectedValue =
+    interaction.data?.values?.[0];
 
-  const selectedIndex = Number.parseInt(
-    selectedValue,
-    10
-  );
+  const selectedIndex =
+    Number.parseInt(
+      selectedValue,
+      10
+    );
 
-  if (!Number.isInteger(selectedIndex)) {
+  if (
+    !Number.isInteger(
+      selectedIndex
+    )
+  ) {
     return res
       .status(400)
-      .send('Invalid staged post selection');
+      .send(
+        'Invalid staged post selection'
+      );
   }
 
-  const redis = new Redis(process.env.REDIS_URL);
+  const redis =
+    new Redis(
+      process.env.REDIS_URL
+    );
 
   try {
-    const stagedPosts = await getStagedPosts(redis);
+    const stagedPosts =
+      await getStagedPosts(
+        redis
+      );
 
     if (!stagedPosts[selectedIndex]) {
       return res.status(200).json(
-        createStagedPreviewResponse(stagedPosts)
+        createStagedPreviewResponse(
+          stagedPosts
+        )
       );
     }
 
@@ -304,24 +467,35 @@ async function handleStagedMove(
   res,
   direction
 ) {
-  const index = getIndexFromCustomId(
-    interaction.data.custom_id
-  );
+  const index =
+    getIndexFromCustomId(
+      interaction.data.custom_id
+    );
 
   if (index === null) {
     return res
       .status(400)
-      .send('Invalid staged post index');
+      .send(
+        'Invalid staged post index'
+      );
   }
 
-  const redis = new Redis(process.env.REDIS_URL);
+  const redis =
+    new Redis(
+      process.env.REDIS_URL
+    );
 
   try {
-    const stagedPosts = await getStagedPosts(redis);
+    const stagedPosts =
+      await getStagedPosts(
+        redis
+      );
 
     if (!stagedPosts[index]) {
       return res.status(200).json(
-        createStagedPreviewResponse(stagedPosts)
+        createStagedPreviewResponse(
+          stagedPosts
+        )
       );
     }
 
@@ -333,7 +507,8 @@ async function handleStagedMove(
     // Already at the relevant end of the queue.
     if (
       targetIndex < 0 ||
-      targetIndex >= stagedPosts.length
+      targetIndex >=
+        stagedPosts.length
     ) {
       return res.status(200).json(
         createStagedPreviewResponse(
@@ -350,7 +525,9 @@ async function handleStagedMove(
     );
 
     const updatedPosts =
-      await getStagedPosts(redis);
+      await getStagedPosts(
+        redis
+      );
 
     return res.status(200).json(
       createStagedPreviewResponse(
@@ -372,21 +549,29 @@ async function handleStagedRemove(
   interaction,
   res
 ) {
-  const index = getIndexFromCustomId(
-    interaction.data.custom_id
-  );
+  const index =
+    getIndexFromCustomId(
+      interaction.data.custom_id
+    );
 
   if (index === null) {
     return res
       .status(400)
-      .send('Invalid staged post index');
+      .send(
+        'Invalid staged post index'
+      );
   }
 
-  const redis = new Redis(process.env.REDIS_URL);
+  const redis =
+    new Redis(
+      process.env.REDIS_URL
+    );
 
   try {
     const stagedPosts =
-      await getStagedPosts(redis);
+      await getStagedPosts(
+        redis
+      );
 
     if (!stagedPosts[index]) {
       return res.status(200).json(
@@ -396,10 +581,15 @@ async function handleStagedRemove(
       );
     }
 
-    await removeStagedPost(redis, index);
+    await removeStagedPost(
+      redis,
+      index
+    );
 
     const updatedPosts =
-      await getStagedPosts(redis);
+      await getStagedPosts(
+        redis
+      );
 
     /*
      * Keep the selection around the same position
@@ -408,10 +598,11 @@ async function handleStagedRemove(
     let selectedIndex = null;
 
     if (updatedPosts.length > 0) {
-      selectedIndex = Math.min(
-        index,
-        updatedPosts.length - 1
-      );
+      selectedIndex =
+        Math.min(
+          index,
+          updatedPosts.length - 1
+        );
     }
 
     return res.status(200).json(
@@ -431,11 +622,12 @@ async function handleStagedRemove(
    ============================================================ */
 
 async function getStagedPosts(redis) {
-  const values = await redis.lrange(
-    STAGED_POSTS_KEY,
-    0,
-    -1
-  );
+  const values =
+    await redis.lrange(
+      STAGED_POSTS_KEY,
+      0,
+      -1
+    );
 
   return values
     .map((value) => {
@@ -451,7 +643,10 @@ async function getStagedPosts(redis) {
       }
     })
     .filter(Boolean)
-    .slice(0, MAX_STAGED_POSTS);
+    .slice(
+      0,
+      MAX_STAGED_POSTS
+    );
 }
 
 
@@ -569,14 +764,20 @@ async function removeStagedPost(
  * staged_down_4
  * staged_remove_4
  */
-function getIndexFromCustomId(customId) {
-  const parts = customId.split('_');
+function getIndexFromCustomId(
+  customId
+) {
+  const parts =
+    customId.split('_');
 
   const value =
     parts[parts.length - 1];
 
   const index =
-    Number.parseInt(value, 10);
+    Number.parseInt(
+      value,
+      10
+    );
 
   if (
     !Number.isInteger(index) ||
@@ -624,25 +825,28 @@ function createStagedPreviewResponse(
    * Graph API carousel limit.
    */
   const embeds =
-    stagedPosts.map((post, index) => ({
-      title: `#${index + 1}`,
+    stagedPosts.map(
+      (post, index) => ({
+        title:
+          `#${index + 1}`,
 
-      description:
-        post.text ||
-        'No confession text available.',
+        description:
+          post.text ||
+          'No confession text available.',
 
-      image: post.imageUrl
-        ? {
-            url: post.imageUrl,
-          }
-        : undefined,
+        image: post.imageUrl
+          ? {
+              url: post.imageUrl,
+            }
+          : undefined,
 
-      footer: {
-        text:
-          `Post ${index + 1} of ` +
-          `${stagedPosts.length}`,
-      },
-    }));
+        footer: {
+          text:
+            `Post ${index + 1} of ` +
+            `${stagedPosts.length}`,
+        },
+      })
+    );
 
 
   /*
@@ -683,7 +887,8 @@ function createStagedPreviewResponse(
                   String(index),
 
                 default:
-                  selectedIndex === index,
+                  selectedIndex ===
+                  index,
               })
             ),
         },
@@ -783,7 +988,10 @@ function truncateText(
   }
 
   return (
-    text.slice(0, maxLength - 1) +
+    text.slice(
+      0,
+      maxLength - 1
+    ) +
     '…'
   );
 }
@@ -806,21 +1014,22 @@ async function editDiscordMessage(
     );
   }
 
-  const response = await fetch(
-    `https://discord.com/api/v10/webhooks/` +
-      `${appId}/${interactionToken}/messages/@original`,
+  const response =
+    await fetch(
+      `https://discord.com/api/v10/webhooks/` +
+        `${appId}/${interactionToken}/messages/@original`,
 
-    {
-      method: 'PATCH',
+      {
+        method: 'PATCH',
 
-      headers: {
-        'Content-Type':
-          'application/json',
-      },
+        headers: {
+          'Content-Type':
+            'application/json',
+        },
 
-      body: JSON.stringify(data),
-    }
-  );
+        body: JSON.stringify(data),
+      }
+    );
 
   if (!response.ok) {
     const responseText =
