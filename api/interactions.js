@@ -1,60 +1,66 @@
 import Redis from 'ioredis';
 import { verifyKey } from 'discord-interactions';
 
-// Tell Vercel NOT to parse the JSON body automatically so we can verify the signature.
+// Tell Vercel NOT to parse the body automatically
 export const config = {
   api: {
     bodyParser: false,
   },
 };
 
+// A rock-solid helper to manually read the raw stream for signature verification
+async function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return res.status(405).send('Method Not Allowed');
   }
 
   try {
-    // 1. Manually read the raw stream into a string
-    const chunks = [];
-    for await (const chunk of req) {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-    }
-    const rawBody = Buffer.concat(chunks).toString('utf8');
-
-    // 2. Verify the request is actually from Discord
+    // 1. Get raw body
+    const rawBody = await getRawBody(req);
+    
+    // 2. Fetch headers & key (adding .trim() just in case Vercel added a hidden space)
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
-    const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+    const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY?.trim();
 
     if (!signature || !timestamp || !PUBLIC_KEY) {
-      return res.status(401).json({ error: 'Missing signature headers or public key' });
+      return res.status(401).send('Missing headers or key');
     }
 
+    // 3. Verify
     const isValidRequest = verifyKey(rawBody, signature, timestamp, PUBLIC_KEY);
 
     if (!isValidRequest) {
-      return res.status(401).json({ error: 'Bad request signature' });
+      return res.status(401).send('Bad request signature');
     }
 
-    // 3. Setup Redis connection
-    const redis = new Redis(process.env.REDIS_URL);
-
-    // 4. Safely parse the JSON
     const interaction = JSON.parse(rawBody);
 
-    // 5. Handle Discord's PING
+    // 4. Handle PING (Type 1) - The exact format Discord demands
     if (interaction.type === 1) {
-      return res.status(200).json({ type: 1 });
+      res.setHeader('Content-Type', 'application/json');
+      return res.status(200).send(JSON.stringify({ type: 1 }));
     }
 
-    // 6. Handle Button Clicks
+    // 5. Handle Buttons (Type 3)
     if (interaction.type === 3) {
+      // Instantly tell Discord we are processing it so it doesn't time out
+      res.setHeader('Content-Type', 'application/json');
+      res.status(200).send(JSON.stringify({ type: 6 })); 
+
       const customId = interaction.data.custom_id;
       const [action, uniqueId] = customId.split('_'); 
+      const redis = new Redis(process.env.REDIS_URL);
       
-      // Tell Discord we are processing the click
-      res.status(200).json({ type: 6 }); 
-
       if (action === 'delete') {
         await redis.del(`conf_${uniqueId}`);
         await editDiscordMessage(interaction.token, {
@@ -66,7 +72,7 @@ export default async function handler(req, res) {
       } else if (action === 'stage') {
         const confessionData = await redis.get(`conf_${uniqueId}`);
         if (confessionData) {
-          // Push to the staging list and clean up the temporary record
+          // Push to the staging queue
           await redis.rpush('staged_posts', confessionData);
           await redis.del(`conf_${uniqueId}`); 
           
@@ -77,9 +83,8 @@ export default async function handler(req, res) {
             components: [] 
           });
         } else {
-            // Handle edge case where data expired or was already staged
             await editDiscordMessage(interaction.token, {
-                content: `⚠️ **Error:** Confession data no longer exists in database.`,
+                content: `⚠️ **Error:** Confession expired or was already staged.`,
                 components: [] 
               });
         }
@@ -93,7 +98,7 @@ export default async function handler(req, res) {
   } catch (error) {
     console.error("Error processing interaction:", error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal Server Error' });
+      res.status(500).send('Internal Server Error');
     }
   }
 }
