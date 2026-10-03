@@ -1,6 +1,8 @@
 import Redis from 'ioredis';
 import { verifyKey } from 'discord-interactions';
 import getRawBody from 'raw-body';
+import { createHash, randomUUID } from 'node:crypto';
+import { publishInstagramPosts } from '../lib/instagram.js';
 
 export const config = {
   api: {
@@ -8,8 +10,14 @@ export const config = {
   },
 };
 
+// Instagram publishing can involve several container-status checks.
+export const maxDuration = 60;
+
 const MAX_STAGED_POSTS = 10;
 const STAGED_POSTS_KEY = 'staged_posts';
+const STAGED_PUBLISH_LOCK_KEY = 'staged_publish_lock';
+const STAGED_PUBLISH_LOCK_TTL_SECONDS = 300;
+const STAGED_LAST_PUBLISH_KEY = 'staged_last_publish';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -29,19 +37,6 @@ export default async function handler(req, res) {
     const PUBLIC_KEY =
       process.env.DISCORD_PUBLIC_KEY?.trim();
 
-    console.log(
-      'Discord interaction verification:',
-      {
-        bodyLength: rawBody.length,
-        signaturePresent: !!signature,
-        signatureLength: signature?.length || 0,
-        timestampPresent: !!timestamp,
-        timestampLength: timestamp?.length || 0,
-        publicKeyPresent: !!PUBLIC_KEY,
-        publicKeyLength: PUBLIC_KEY?.length || 0,
-      }
-    );
-
     if (!signature || !timestamp || !PUBLIC_KEY) {
       console.error(
         'Discord verification failed: missing signature, timestamp, or public key.'
@@ -60,11 +55,6 @@ export default async function handler(req, res) {
         PUBLIC_KEY
       );
 
-    console.log(
-      'Discord signature verification result:',
-      isValidRequest
-    );
-
     if (!isValidRequest) {
       console.error(
         'Discord verification failed: invalid signature.'
@@ -77,11 +67,6 @@ export default async function handler(req, res) {
 
     const interaction =
       JSON.parse(rawBody);
-
-    console.log(
-      'Discord interaction type:',
-      interaction.type
-    );
 
     // Discord endpoint verification.
     if (interaction.type === 1) {
@@ -292,6 +277,125 @@ async function handleModerationButton(
      * STAGE
      */
     if (action === 'stage') {
+      const lockToken =
+        randomUUID();
+
+      const lockAcquired =
+        await acquireStagedPublishLock(
+          redis,
+          lockToken
+        );
+
+      if (!lockAcquired) {
+        await editDiscordMessage(
+          interaction.token,
+          {
+            content:
+              '⚠️ **Instagram publishing is currently in progress.** Please try staging this confession again in a moment.',
+          }
+        );
+
+        return;
+      }
+
+      try {
+        const confessionData =
+          await redis.get(
+            `conf_${uniqueId}`
+          );
+
+        if (!confessionData) {
+          await editDiscordMessage(
+            interaction.token,
+            {
+              content:
+                '⚠️ **Error:** Confession expired or was already staged.',
+
+              components: [],
+            }
+          );
+
+          return;
+        }
+
+        /*
+         * Atomically check the queue size and add the confession.
+         *
+         * This is deliberately done inside Redis rather than:
+         *
+         *   LLEN
+         *   then RPUSH
+         *
+         * because two simultaneous requests could otherwise both see
+         * 9 posts and both add one, resulting in 11.
+         */
+        const added =
+          await redis.eval(
+            `
+              if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+                return 0
+              end
+
+              redis.call('RPUSH', KEYS[1], ARGV[2])
+              return 1
+            `,
+            1,
+            STAGED_POSTS_KEY,
+            MAX_STAGED_POSTS,
+            confessionData
+          );
+
+        if (!added) {
+          await editDiscordMessage(
+            interaction.token,
+            {
+              content:
+                `🔴 **Staging queue is full (${MAX_STAGED_POSTS}/${MAX_STAGED_POSTS}).**`,
+
+              components: [],
+            }
+          );
+
+          return;
+        }
+
+        // Only delete the temporary confession once staging succeeded.
+        await redis.del(
+          `conf_${uniqueId}`
+        );
+
+        const queueLength =
+          await redis.llen(
+            STAGED_POSTS_KEY
+          );
+
+        await editDiscordMessage(
+          interaction.token,
+          {
+            content:
+              `🟡 **Staged.** (Current Queue: ${queueLength}/${MAX_STAGED_POSTS})`,
+
+            components: [],
+          }
+        );
+      } finally {
+        await releaseStagedPublishLock(
+          redis,
+          lockToken
+        );
+      }
+
+      return;
+    }
+
+    /*
+     * POST NOW
+     *
+     * Publish this single confession directly to Instagram.
+     * The Redis record is only removed after Meta confirms the
+     * publish request succeeded.
+     */
+    if (action === 'post') {
       const confessionData =
         await redis.get(
           `conf_${uniqueId}`
@@ -302,7 +406,9 @@ async function handleModerationButton(
           interaction.token,
           {
             content:
-              '⚠️ **Error:** Confession expired or was already staged.',
+              '⚠️ **Error:** Confession expired or was already handled.',
+
+            embeds: [],
 
             components: [],
           }
@@ -311,62 +417,143 @@ async function handleModerationButton(
         return;
       }
 
-      /*
-       * Atomically check the queue size and add the confession.
-       *
-       * This is deliberately done inside Redis rather than:
-       *
-       *   LLEN
-       *   then RPUSH
-       *
-       * because two simultaneous requests could otherwise both see
-       * 9 posts and both add one, resulting in 11.
-       */
-      const added =
-        await redis.eval(
-          `
-            if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
-              return 0
-            end
+      let confession;
 
-            redis.call('RPUSH', KEYS[1], ARGV[2])
-            return 1
-          `,
-          1,
-          STAGED_POSTS_KEY,
-          MAX_STAGED_POSTS,
-          confessionData
+      try {
+        confession =
+          JSON.parse(
+            confessionData
+          );
+      } catch (error) {
+        throw new Error(
+          'The stored confession data is invalid JSON.'
         );
-
-      if (!added) {
-        await editDiscordMessage(
-          interaction.token,
-          {
-            content:
-              `🔴 **Staging queue is full (${MAX_STAGED_POSTS}/${MAX_STAGED_POSTS}).**`,
-
-            components: [],
-          }
-        );
-
-        return;
       }
-
-      // Only delete the temporary confession once staging succeeded.
-      await redis.del(
-        `conf_${uniqueId}`
-      );
-
-      const queueLength =
-        await redis.llen(
-          STAGED_POSTS_KEY
-        );
 
       await editDiscordMessage(
         interaction.token,
         {
           content:
-            `🟡 **Staged.** (Current Queue: ${queueLength}/${MAX_STAGED_POSTS})`,
+            '⏳ **Publishing to Instagram...**',
+
+          components: [],
+        }
+      );
+
+      try {
+        await publishInstagramPosts([
+          confession,
+        ]);
+
+        // Only clear the temporary confession after a confirmed publish.
+        await redis.del(
+          `conf_${uniqueId}`
+        );
+
+        await editDiscordMessage(
+          interaction.token,
+          {
+            content:
+              '🟢 **Posted Live to Instagram.**',
+
+            embeds: [],
+
+            components: [],
+          }
+        );
+      } catch (error) {
+        console.error(
+          'Instagram Post Now failed:',
+          error
+        );
+
+        await editDiscordMessage(
+          interaction.token,
+          {
+            content:
+              `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\n` +
+              'The confession was kept so it can be retried.',
+
+            components: [],
+          }
+        );
+      }
+
+      return;
+    }
+  } finally {
+    redis.disconnect();
+  }
+}
+
+
+/* ============================================================
+   PUBLISH STAGED POSTS
+   ============================================================ */
+
+async function handleStagedPublish(
+  interaction,
+  res
+) {
+  /*
+   * Acknowledge the button immediately. Publishing can require
+   * multiple Meta API requests and must not exceed Discord's
+   * initial interaction response window.
+   */
+  res.status(200).json({
+    type: 5,
+
+    data: {
+      flags: 64,
+    },
+  });
+
+  const redis =
+    new Redis(
+      process.env.REDIS_URL
+    );
+
+  const lockToken =
+    randomUUID();
+
+  let lockAcquired = false;
+
+  try {
+    lockAcquired =
+      await acquireStagedPublishLock(
+        redis,
+        lockToken
+      );
+
+    if (!lockAcquired) {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '⚠️ **Instagram publishing is already in progress.** Please wait for it to finish before trying again.',
+
+          embeds: [],
+
+          components: [],
+        }
+      );
+
+      return;
+    }
+
+    const stagedPosts =
+      await getStagedPosts(
+        redis
+      );
+
+    if (stagedPosts.length === 0) {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            'There are currently no staged confessions to publish.',
+
+          embeds: [],
 
           components: [],
         }
@@ -376,23 +563,131 @@ async function handleModerationButton(
     }
 
     /*
-     * POST NOW
-     *
-     * This currently only changes the Discord moderation message.
-     * We'll replace this with the Graph API posting logic later.
+     * Create a stable fingerprint of the exact queue we are about
+     * to publish. If a previous publish succeeded but Redis failed
+     * before the queue was cleared, this lets a retry clean up the
+     * already-published queue without publishing it twice.
      */
-    if (action === 'post') {
+    const queueFingerprint =
+      createStagedQueueFingerprint(
+        stagedPosts
+      );
+
+    const lastPublished =
+      await redis.get(
+        STAGED_LAST_PUBLISH_KEY
+      );
+
+    if (lastPublished === queueFingerprint) {
+      await redis.del(
+        STAGED_POSTS_KEY
+      );
+
       await editDiscordMessage(
         interaction.token,
         {
           content:
-            '🟢 **Posted Live.**',
+            `🟢 **Already published.** Redis cleanup completed for ${stagedPosts.length} staged ` +
+            `${stagedPosts.length === 1 ? 'post' : 'posts'}.`,
+
+          embeds: [],
 
           components: [],
         }
       );
+
+      return;
+    }
+
+    await editDiscordMessage(
+      interaction.token,
+      {
+        content:
+          `⏳ **Publishing ${stagedPosts.length} ` +
+          `${stagedPosts.length === 1 ? 'staged post' : 'staged posts'} to Instagram...**`,
+
+        embeds: [],
+
+        components: [],
+      }
+    );
+
+    const publishResult =
+      await publishInstagramPosts(
+        stagedPosts
+      );
+
+    /*
+     * Record the exact queue that was successfully published before
+     * deleting it. If the DELETE itself fails, a retry can detect
+     * the matching fingerprint and safely clear the queue without
+     * publishing a duplicate.
+     */
+    await redis.set(
+      STAGED_LAST_PUBLISH_KEY,
+      queueFingerprint,
+      'EX',
+      86400
+    );
+
+    await redis.del(
+      STAGED_POSTS_KEY
+    );
+
+    const publishSummary =
+      publishResult.type === 'carousel'
+        ? `🟢 **Published ${publishResult.count} staged confessions as 1 Instagram carousel.**`
+        : '🟢 **Published 1 staged confession to Instagram.**';
+
+    await editDiscordMessage(
+      interaction.token,
+      {
+        content:
+          publishSummary,
+
+        embeds: [],
+
+        components: [],
+      }
+    );
+  } catch (error) {
+    console.error(
+      'Instagram staged publish failed:',
+      error
+    );
+
+    try {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\n` +
+            'The staged queue has been kept intact so nothing is lost.',
+
+          components: [],
+        }
+      );
+    } catch (discordError) {
+      console.error(
+        'Failed to update Discord after Instagram publish error:',
+        discordError
+      );
     }
   } finally {
+    if (lockAcquired) {
+      try {
+        await releaseStagedPublishLock(
+          redis,
+          lockToken
+        );
+      } catch (lockError) {
+        console.error(
+          'Failed to release staged publish lock:',
+          lockError
+        );
+      }
+    }
+
     redis.disconnect();
   }
 }
@@ -485,7 +780,31 @@ async function handleStagedMove(
       process.env.REDIS_URL
     );
 
+  const lockToken =
+    randomUUID();
+
+  let lockAcquired = false;
+
   try {
+    lockAcquired =
+      await acquireStagedPublishLock(
+        redis,
+        lockToken
+      );
+
+    if (!lockAcquired) {
+      return res.status(200).json({
+        type: 4,
+
+        data: {
+          content:
+            '⚠️ **Instagram publishing is currently in progress.** Please wait for it to finish before changing the staged queue.',
+
+          flags: 64,
+        },
+      });
+    }
+
     const stagedPosts =
       await getStagedPosts(
         redis
@@ -536,6 +855,13 @@ async function handleStagedMove(
       )
     );
   } finally {
+    if (lockAcquired) {
+      await releaseStagedPublishLock(
+        redis,
+        lockToken
+      );
+    }
+
     redis.disconnect();
   }
 }
@@ -567,7 +893,31 @@ async function handleStagedRemove(
       process.env.REDIS_URL
     );
 
+  const lockToken =
+    randomUUID();
+
+  let lockAcquired = false;
+
   try {
+    lockAcquired =
+      await acquireStagedPublishLock(
+        redis,
+        lockToken
+      );
+
+    if (!lockAcquired) {
+      return res.status(200).json({
+        type: 4,
+
+        data: {
+          content:
+            '⚠️ **Instagram publishing is currently in progress.** Please wait for it to finish before changing the staged queue.',
+
+          flags: 64,
+        },
+      });
+    }
+
     const stagedPosts =
       await getStagedPosts(
         redis
@@ -612,8 +962,81 @@ async function handleStagedRemove(
       )
     );
   } finally {
+    if (lockAcquired) {
+      await releaseStagedPublishLock(
+        redis,
+        lockToken
+      );
+    }
+
     redis.disconnect();
   }
+}
+
+
+/* ============================================================
+   STAGED QUEUE LOCK / PUBLISH HELPERS
+   ============================================================ */
+
+async function acquireStagedPublishLock(
+  redis,
+  lockToken
+) {
+  const result =
+    await redis.set(
+      STAGED_PUBLISH_LOCK_KEY,
+      lockToken,
+      'NX',
+      'EX',
+      STAGED_PUBLISH_LOCK_TTL_SECONDS
+    );
+
+  return result === 'OK';
+}
+
+async function releaseStagedPublishLock(
+  redis,
+  lockToken
+) {
+  await redis.eval(
+    `
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+      end
+
+      return 0
+    `,
+    1,
+    STAGED_PUBLISH_LOCK_KEY,
+    lockToken
+  );
+}
+
+function createStagedQueueFingerprint(
+  stagedPosts
+) {
+  return createHash(
+    'sha256'
+  )
+    .update(
+      JSON.stringify(
+        stagedPosts
+      )
+    )
+    .digest('hex');
+}
+
+function formatInstagramError(
+  error
+) {
+  if (!error) {
+    return 'Unknown Instagram error.';
+  }
+
+  return (
+    error.message ||
+    'Unknown Instagram error.'
+  );
 }
 
 
@@ -952,6 +1375,31 @@ function createStagedPreviewResponse(
 
           disabled:
             selectedIndex === null,
+        },
+      ],
+    },
+
+    /*
+     * Third row:
+     *
+     * Publish the complete queue to Instagram.
+     * One staged post becomes a single image post.
+     * Two to ten staged posts become a carousel.
+     */
+    {
+      type: 1,
+
+      components: [
+        {
+          type: 2,
+
+          style: 3,
+
+          label:
+            '📸 Post Staged to Instagram',
+
+          custom_id:
+            'staged_post',
         },
       ],
     },
