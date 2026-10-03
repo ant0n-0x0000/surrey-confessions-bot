@@ -3,9 +3,7 @@ import { verifyKey } from 'discord-interactions';
 import getRawBody from 'raw-body';
 
 export const config = {
-  api: {
-    bodyParser: false,
-  },
+  api: { bodyParser: false },
 };
 
 export default async function handler(req, res) {
@@ -14,11 +12,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. Safely grab the raw body using the standard library
     const rawBodyBuffer = await getRawBody(req);
     const rawBody = rawBodyBuffer.toString('utf8');
     
-    // 2. Fetch headers & key
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
     const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY?.trim();
@@ -27,7 +23,6 @@ export default async function handler(req, res) {
       return res.status(401).send('Missing headers or key');
     }
 
-    // 3. Verify
     const isValidRequest = verifyKey(rawBody, signature, timestamp, PUBLIC_KEY);
 
     if (!isValidRequest) {
@@ -36,16 +31,13 @@ export default async function handler(req, res) {
 
     const interaction = JSON.parse(rawBody);
 
-    // 4. Handle PING (Type 1)
     if (interaction.type === 1) {
-      res.setHeader('Content-Type', 'application/json');
-      return res.status(200).send(JSON.stringify({ type: 1 }));
+      // Send native JSON to guarantee strict formatting for Discord
+      return res.status(200).json({ type: 1 });
     }
 
-    // 5. Handle Buttons (Type 3)
     if (interaction.type === 3) {
-      res.setHeader('Content-Type', 'application/json');
-      res.status(200).send(JSON.stringify({ type: 6 })); 
+      res.status(200).json({ type: 6 }); 
 
       const customId = interaction.data.custom_id;
       const [action, uniqueId] = customId.split('_'); 
@@ -73,7 +65,7 @@ export default async function handler(req, res) {
           });
         } else {
             await editDiscordMessage(interaction.token, {
-                content: `⚠️️ **Error:** Confession expired or was already staged.`,
+                content: `⚠️ **Error:** Confession expired or was already staged.`,
                 components: [] 
               });
         }
