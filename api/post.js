@@ -1,24 +1,19 @@
+import { kv } from '@vercel/kv';
+
 export default async function handler(req, res) {
-  // 1. Security Check
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
   try {
-    // 2. Extract ONLY the confession text from Tally's massive webhook
     const tallyData = req.body;
-    
-    // This digs through the JSON structure you provided to find the exact text
     const text = tallyData?.data?.fields?.[0]?.value;
 
     if (!text) {
-      // Return a 200 OK so Tally accepts the initial setup ping
       return res.status(200).json({ message: 'Webhook received, but no confession text found (likely a test ping).' });
     }
 
-    // 3. Ask OpenAI if the text is safe (Saving tokens because we only send the text!)
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    
     const aiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -50,13 +45,10 @@ BLOCK (Set is_safe to false) if the text violates ANY of these strict rules:
     const aiData = await aiResponse.json();
     const moderation = JSON.parse(aiData.choices[0].message.content);
 
-    // 4. The Kill Switch
     if (moderation.is_safe === false) {
-      // The script stops here. We return a 200 success so Tally knows the webhook was received.
       return res.status(200).json({ success: true, message: "Blocked by AI." });
     }
 
-    // 5. Cloudinary Image Generation
     const safeText = encodeURIComponent(encodeURIComponent(text));
     const cloudName = "hff7fini";
     const backgroundName = "surrey_background.jpg"; 
@@ -67,19 +59,45 @@ BLOCK (Set is_safe to false) if the text violates ANY of these strict rules:
       `r_30/fl_layer_apply/` +
       `${backgroundName}`;
 
-    // 6. Send to Discord
-    const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+    // 1. Generate a unique ID for this specific confession
+    const uniqueId = crypto.randomUUID();
+
+    // 2. Save the data to Vercel KV so the next script can retrieve it. 
+    // { ex: 86400 } automatically deletes the record after 24 hours to keep your DB clean.
+    await kv.set(`conf_${uniqueId}`, { text, imageUrl }, { ex: 86400 });
+
+    const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+    const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
     
-    await fetch(DISCORD_WEBHOOK_URL, {
+    // 3. Send Interactive Message to Discord using the Bot API
+    const discordResponse = await fetch(`https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bot ${DISCORD_BOT_TOKEN}`
+      },
       body: JSON.stringify({
         content: `🟢 **New Confession Passed Moderation!**\n> ${text}`,
-        embeds: [{ image: { url: imageUrl } }]
+        embeds: [{ image: { url: imageUrl } }],
+        components: [
+          {
+            type: 1, // Action Row
+            components: [
+              { type: 2, style: 1, label: "Stage", custom_id: `stage_${uniqueId}` },
+              { type: 2, style: 3, label: "Post Now", custom_id: `post_${uniqueId}` },
+              { type: 2, style: 4, label: "Delete", custom_id: `delete_${uniqueId}` }
+            ]
+          }
+        ]
       })
     });
 
-    return res.status(200).json({ success: true, cloudinaryUrl: imageUrl });
+    if (!discordResponse.ok) {
+       const err = await discordResponse.json();
+       throw new Error(`Discord API Error: ${JSON.stringify(err)}`);
+    }
+
+    return res.status(200).json({ success: true, id: uniqueId });
 
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
