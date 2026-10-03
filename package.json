@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "dependencies": {
     "ioredis": "^5.3.2",
-    "discord-interactions": "^4.1.0"
+    "discord-interactions": "^4.1.0",
+    "raw-body": "^2.5.2"
   }
 }
