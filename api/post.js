@@ -1,6 +1,4 @@
-import Redis from 'ioredis';
-
-const redis = new Redis(process.env.REDIS_URL);
+import { createRedis, closeRedis } from '../lib/redis.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -8,6 +6,8 @@ export default async function handler(req, res) {
       error: 'Method Not Allowed',
     });
   }
+
+  let redis;
 
   try {
     const tallyData = req.body;
@@ -19,6 +19,8 @@ export default async function handler(req, res) {
           'Webhook received, but no confession text found (likely a test ping).',
       });
     }
+
+    redis = await createRedis();
 
     const safeText = encodeURIComponent(
       encodeURIComponent(text)
@@ -138,5 +140,7 @@ export default async function handler(req, res) {
       success: false,
       error: error.message,
     });
+  } finally {
+    closeRedis(redis);
   }
 }

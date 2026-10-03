@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { createRedis, closeRedis } from '../lib/redis.js';
 import { verifyKey } from 'discord-interactions';
 import getRawBody from 'raw-body';
 import { createHash, randomUUID } from 'node:crypto';
@@ -122,9 +122,7 @@ async function handleCommand(
 
   if (commandName === 'staged') {
     const redis =
-      new Redis(
-        process.env.REDIS_URL
-      );
+      await createRedis();
 
     try {
       const stagedPosts =
@@ -136,7 +134,7 @@ async function handleCommand(
         )
       );
     } finally {
-      redis.disconnect();
+      closeRedis(redis);
     }
   }
 
@@ -244,12 +242,10 @@ async function handleModerationButton(
   const [action, uniqueId] =
     customId.split('_');
 
-  const redis =
-    new Redis(
-      process.env.REDIS_URL
-    );
+  let redis;
 
   try {
+    redis = await createRedis();
     /*
      * DELETE
      */
@@ -481,8 +477,32 @@ async function handleModerationButton(
 
       return;
     }
+  } catch (error) {
+    console.error(
+      'Moderation button failed:',
+      error
+    );
+
+    try {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            `🔴 **Action failed.**\n> ${formatInstagramError(error)}\n\nPlease try again in a moment.`,
+
+          embeds: [],
+
+          components: [],
+        }
+      );
+    } catch (discordError) {
+      console.error(
+        'Failed to update Discord after moderation error:',
+        discordError
+      );
+    }
   } finally {
-    redis.disconnect();
+    closeRedis(redis);
   }
 }
 
@@ -508,10 +528,7 @@ async function handleStagedPublish(
     },
   });
 
-  const redis =
-    new Redis(
-      process.env.REDIS_URL
-    );
+  let redis;
 
   const lockToken =
     randomUUID();
@@ -519,6 +536,7 @@ async function handleStagedPublish(
   let lockAcquired = false;
 
   try {
+    redis = await createRedis();
     lockAcquired =
       await acquireStagedPublishLock(
         redis,
@@ -688,7 +706,7 @@ async function handleStagedPublish(
       }
     }
 
-    redis.disconnect();
+    closeRedis(redis);
   }
 }
 
@@ -723,9 +741,7 @@ async function handleStagedSelection(
   }
 
   const redis =
-    new Redis(
-      process.env.REDIS_URL
-    );
+    await createRedis();
 
   try {
     const stagedPosts =
@@ -748,7 +764,7 @@ async function handleStagedSelection(
       )
     );
   } finally {
-    redis.disconnect();
+    closeRedis(redis);
   }
 }
 
@@ -776,9 +792,7 @@ async function handleStagedMove(
   }
 
   const redis =
-    new Redis(
-      process.env.REDIS_URL
-    );
+    await createRedis();
 
   const lockToken =
     randomUUID();
@@ -862,7 +876,7 @@ async function handleStagedMove(
       );
     }
 
-    redis.disconnect();
+    closeRedis(redis);
   }
 }
 
@@ -889,9 +903,7 @@ async function handleStagedRemove(
   }
 
   const redis =
-    new Redis(
-      process.env.REDIS_URL
-    );
+    await createRedis();
 
   const lockToken =
     randomUUID();
@@ -969,7 +981,7 @@ async function handleStagedRemove(
       );
     }
 
-    redis.disconnect();
+    closeRedis(redis);
   }
 }
 
