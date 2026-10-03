@@ -1,4 +1,5 @@
-import { kv } from '@vercel/kv';
+import Redis from 'ioredis';
+const redis = new Redis(process.env.REDIS_URL);
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -62,9 +63,8 @@ BLOCK (Set is_safe to false) if the text violates ANY of these strict rules:
     // 1. Generate a unique ID for this specific confession
     const uniqueId = crypto.randomUUID();
 
-    // 2. Save the data to Vercel KV so the next script can retrieve it. 
-    // { ex: 86400 } automatically deletes the record after 24 hours to keep your DB clean.
-    await kv.set(`conf_${uniqueId}`, { text, imageUrl }, { ex: 86400 });
+    // 2. Save the data to Redis (expires in 86400 seconds / 24 hours)
+    await redis.set(`conf_${uniqueId}`, JSON.stringify({ text, imageUrl }), 'EX', 86400);
 
     const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
     const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
