@@ -3,6 +3,7 @@ import { verifyKey } from 'discord-interactions';
 import getRawBody from 'raw-body';
 import { createHash, randomUUID } from 'node:crypto';
 import { publishInstagramPosts } from '../lib/instagram.js';
+import { createConfessionImageUrl } from '../lib/cloudinary.js';
 import { waitUntil } from '@vercel/functions';
 
 export const config = {
@@ -723,6 +724,11 @@ async function processPostNow(
       );
     }
 
+    // Regenerate the preview URL so pending submissions created before this
+    // deployment also use the current Background v2 design when published.
+    confession.imageUrl =
+      createConfessionImageUrl(confession.text).imageUrl;
+
     await editDiscordMessage(
       interaction.token,
       {
@@ -941,9 +947,27 @@ async function processStagedPublish(
       }
     );
 
+    // Rebuild image URLs from the stored confession text. This upgrades any
+    // posts that were staged before the new design was deployed, without
+    // needing a Redis migration or changing their order.
+    const postsWithCurrentDesign =
+      stagedPosts.map((post) => {
+        if (typeof post.text !== 'string' || !post.text.trim()) {
+          throw new Error(
+            'A staged confession is missing its text and cannot be rendered with the current design.'
+          );
+        }
+
+        return {
+          ...post,
+          imageUrl:
+            createConfessionImageUrl(post.text).imageUrl,
+        };
+      });
+
     const publishResult =
       await publishInstagramPosts(
-        stagedPosts,
+        postsWithCurrentDesign,
         instagramCaption
       );
 
@@ -1575,26 +1599,44 @@ function createStagedPreviewResponse(
    */
   const embeds =
     stagedPosts.map(
-      (post, index) => ({
-        title:
-          `#${index + 1}`,
+      (post, index) => {
+        let previewImageUrl = post.imageUrl;
 
-        description:
-          post.text ||
-          'No confession text available.',
+        // Prefer the current design for old staged items, while keeping the
+        // preview usable if a legacy confession cannot be rendered.
+        if (typeof post.text === 'string' && post.text.trim()) {
+          try {
+            previewImageUrl =
+              createConfessionImageUrl(post.text).imageUrl;
+          } catch (error) {
+            console.warn(
+              '[Cloudinary] Could not regenerate staged preview image:',
+              error.message
+            );
+          }
+        }
 
-        image: post.imageUrl
-          ? {
-              url: post.imageUrl,
-            }
-          : undefined,
+        return {
+          title:
+            `#${index + 1}`,
 
-        footer: {
-          text:
-            `Post ${index + 1} of ` +
-            `${stagedPosts.length}`,
-        },
-      })
+          description:
+            post.text ||
+            'No confession text available.',
+
+          image: previewImageUrl
+            ? {
+                url: previewImageUrl,
+              }
+            : undefined,
+
+          footer: {
+            text:
+              `Post ${index + 1} of ` +
+              `${stagedPosts.length}`,
+          },
+        };
+      }
     );
 
 

@@ -5,6 +5,7 @@
     "ioredis": "^5.3.2",
     "discord-interactions": "^4.1.0",
     "raw-body": "^2.5.2",
-    "@vercel/functions": "^3.9.11"
+    "@vercel/functions": "^3.9.11",
+    "string-pixel-width": "^1.11.0"
   }
 }

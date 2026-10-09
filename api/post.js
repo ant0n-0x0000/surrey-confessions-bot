@@ -1,4 +1,5 @@
 import { createRedis, closeRedis } from '../lib/redis.js';
+import { createConfessionImageUrl } from '../lib/cloudinary.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -22,19 +23,18 @@ export default async function handler(req, res) {
 
     redis = await createRedis();
 
-    const safeText = encodeURIComponent(
-      encodeURIComponent(text)
+    const { imageUrl, layout } =
+      createConfessionImageUrl(text);
+
+    console.log(
+      '[Cloudinary] Created confession image URL:',
+      {
+        fontSize: layout.fontSize,
+        lineCount: layout.lines.length,
+        estimatedBoxWidth: Math.round(layout.estimatedOuterWidth),
+        estimatedBoxHeight: Math.round(layout.estimatedOuterHeight),
+      }
     );
-
-    const cloudName = 'hff7fini';
-    const backgroundName = 'surrey_background.jpg';
-
-    const imageUrl =
-      `https://res.cloudinary.com/${cloudName}/image/upload/` +
-      `l_text:Arial_45:${safeText},co_black,c_fit,w_800/` +
-      `b_rgb:E6E9EB,bo_40px_solid_rgb:E6E9EB/` +
-      `r_30/fl_layer_apply/` +
-      `${backgroundName}`;
 
     // Generate a unique ID for this confession.
     const uniqueId = crypto.randomUUID();
