@@ -16,6 +16,8 @@ export const config = {
 export const maxDuration = 60;
 
 const MAX_STAGED_POSTS = 10;
+const CONFESSION_TTL_SECONDS = 86400;
+const MODERATOR_USER_ID = '145224646868860928';
 const STAGED_POSTS_KEY = 'staged_posts';
 const STAGED_PUBLISH_LOCK_KEY = 'staged_publish_lock';
 const STAGED_PUBLISH_LOCK_TTL_SECONDS = 300;
@@ -184,8 +186,52 @@ async function handleComponent(
     );
   }
 
-  // Post Now opens a caption modal before publishing.
+  // Restore an expired submission from its Discord moderation message before
+  // opening the caption modal. The Redis record still gets a short TTL.
   if (customId.startsWith('post_')) {
+    const uniqueId =
+      customId.slice('post_'.length);
+
+    let redis;
+
+    try {
+      redis = await createRedis();
+
+      const confession =
+        await getOrRestoreConfession(
+          redis,
+          uniqueId,
+          interaction
+        );
+
+      if (!confession) {
+        return res.status(200).json({
+          type: 4,
+          data: {
+            content:
+              '⚠️ **This confession could not be recovered.** Its original text is no longer available in the moderation message. Please resubmit it through Tally.',
+            flags: 64,
+          },
+        });
+      }
+    } catch (error) {
+      console.error(
+        'Failed to restore confession before Post Now:',
+        error
+      );
+
+      return res.status(200).json({
+        type: 4,
+        data: {
+          content:
+            '⚠️ **Could not load this confession.** Please try again in a moment.',
+          flags: 64,
+        },
+      });
+    } finally {
+      closeRedis(redis);
+    }
+
     return showCaptionModal(
       interaction,
       res,
@@ -541,73 +587,94 @@ async function processModerationButton(
         );
 
       if (!lockAcquired) {
-        await editDiscordMessage(
-          interaction.token,
-          {
-            content:
-              '⚠️ **Instagram publishing is currently in progress.** Please try staging this confession again in a moment.',
-          }
+        await sendInteractionFollowup(
+          interaction,
+          '⚠️ **Instagram publishing is currently in progress.** Please try staging this confession again in a moment.'
         );
 
         return;
       }
 
       try {
-        const confessionData =
-          await redis.get(
-            `conf_${uniqueId}`
+        const confession =
+          await getOrRestoreConfession(
+            redis,
+            uniqueId,
+            interaction
           );
 
-        if (!confessionData) {
-          await editDiscordMessage(
-            interaction.token,
-            {
-              content:
-                '⚠️ **Error:** Confession expired or was already staged.',
-
-              components: [],
-            }
+        if (!confession) {
+          await sendInteractionFollowup(
+            interaction,
+            '⚠️ **This confession could not be recovered.** Its original text is no longer available in the moderation message. Please resubmit it through Tally.'
           );
 
           return;
         }
 
+        // Keep the source Discord identifiers with the staged item so an
+        // unstage can restore its buttons and a successful publish can remove
+        // its now-obsolete moderation message.
+        const stagedConfession = {
+          ...confession,
+          uniqueId,
+          discordChannelId:
+            interaction.channel_id || null,
+          discordMessageId:
+            interaction.message?.id || null,
+        };
+
         /*
-         * Atomically check the queue size and add the confession.
-         *
-         * This is deliberately done inside Redis rather than:
-         *
-         *   LLEN
-         *   then RPUSH
-         *
-         * because two simultaneous requests could otherwise both see
-         * 9 posts and both add one, resulting in 11.
+         * Atomically check the queue size, prevent duplicates, and add the
+         * confession. All three operations happen inside Redis to avoid race
+         * conditions when button clicks overlap.
+         * Return values: 1 = added, 0 = full, -1 = already staged.
          */
         const added =
           await redis.eval(
             `
+              local existingPosts =
+                redis.call('LRANGE', KEYS[1], 0, -1)
+
+              for _, existingJson in ipairs(existingPosts) do
+                local ok, existing = pcall(cjson.decode, existingJson)
+                if ok and existing and existing.uniqueId == ARGV[2] then
+                  return -1
+                end
+              end
+
               if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
                 return 0
               end
 
-              redis.call('RPUSH', KEYS[1], ARGV[2])
+              redis.call('RPUSH', KEYS[1], ARGV[3])
               return 1
             `,
             1,
             STAGED_POSTS_KEY,
             MAX_STAGED_POSTS,
-            confessionData
+            uniqueId,
+            JSON.stringify(stagedConfession)
           );
 
-        if (!added) {
-          await editDiscordMessage(
-            interaction.token,
-            {
-              content:
-                `🔴 **Staging queue is full (${MAX_STAGED_POSTS}/${MAX_STAGED_POSTS}).**`,
+        if (added === 0) {
+          // Leave the original confession and its buttons untouched. It can
+          // be staged later when a slot becomes available.
+          await sendInteractionFollowup(
+            interaction,
+            `🔴 **Staging queue is full (${MAX_STAGED_POSTS}/${MAX_STAGED_POSTS}).** This confession has not been staged; its buttons are still available.`
+          );
 
-              components: [],
-            }
+          return;
+        }
+
+        if (added === -1) {
+          // A rapid double-click can arrive with an old interaction payload.
+          // Do not overwrite the already-staged message or add a duplicate.
+          await redis.del(`conf_${uniqueId}`);
+          await sendInteractionFollowup(
+            interaction,
+            'ℹ️ **This confession is already in the staged queue.**'
           );
 
           return;
@@ -649,20 +716,15 @@ async function processModerationButton(
     );
 
     try {
-      await editDiscordMessage(
-        interaction.token,
-        {
-          content:
-            `🔴 **Action failed.**\n> ${formatInstagramError(error)}\n\nPlease try again in a moment.`,
-
-          embeds: [],
-
-          components: [],
-        }
+      // Do not replace the source message on a transient error: its content
+      // is the recovery copy if the Redis record has expired.
+      await sendInteractionFollowup(
+        interaction,
+        `🔴 **Action failed.**\n> ${formatInstagramError(error)}\n\nPlease try again in a moment.`
       );
     } catch (discordError) {
       console.error(
-        'Failed to update Discord after moderation error:',
+        'Failed to send moderation error follow-up:',
         discordError
       );
     }
@@ -690,17 +752,19 @@ async function processPostNow(
   try {
     redis = await createRedis();
 
-    const confessionData =
-      await redis.get(
-        `conf_${uniqueId}`
+    let confession =
+      await getOrRestoreConfession(
+        redis,
+        uniqueId,
+        interaction
       );
 
-    if (!confessionData) {
+    if (!confession) {
       await editDiscordMessage(
         interaction.token,
         {
           content:
-            '⚠️ **Error:** Confession expired or was already handled.',
+            '⚠️ **Error:** This confession expired and could not be recovered from the original Discord message.',
 
           embeds: [],
 
@@ -709,19 +773,6 @@ async function processPostNow(
       );
 
       return;
-    }
-
-    let confession;
-
-    try {
-      confession =
-        JSON.parse(
-          confessionData
-        );
-    } catch (error) {
-      throw new Error(
-        'The stored confession data is invalid JSON.'
-      );
     }
 
     // Regenerate the preview URL so pending submissions created before this
@@ -918,6 +969,10 @@ async function processStagedPublish(
         STAGED_POSTS_KEY
       );
 
+      await deletePublishedSourceMessages(
+        stagedPosts
+      );
+
       await editDiscordMessage(
         interaction.token,
         {
@@ -986,6 +1041,13 @@ async function processStagedPublish(
 
     await redis.del(
       STAGED_POSTS_KEY
+    );
+
+    // These source messages no longer represent pending submissions. Remove
+    // them after a confirmed publish so the moderation channel stays focused
+    // on confessions that still need action.
+    await deletePublishedSourceMessages(
+      stagedPosts
     );
 
     const publishSummary =
@@ -1279,10 +1341,28 @@ async function handleStagedRemove(
       );
     }
 
+    const postToUnstage =
+      stagedPosts[index];
+
     await removeStagedPost(
       redis,
       index
     );
+
+    let sourceMessageRestored = false;
+
+    try {
+      sourceMessageRestored =
+        await restoreModerationPostAfterUnstage(
+          redis,
+          postToUnstage
+        );
+    } catch (error) {
+      console.error(
+        '[Moderation] Unstaged post, but failed to restore its source message:',
+        error
+      );
+    }
 
     const updatedPosts =
       await getStagedPosts(
@@ -1303,11 +1383,19 @@ async function handleStagedRemove(
         );
     }
 
-    return res.status(200).json(
+    const previewResponse =
       createStagedPreviewResponse(
         updatedPosts,
         selectedIndex
-      )
+      );
+
+    if (!sourceMessageRestored) {
+      previewResponse.data.content +=
+        '\n\n⚠️ This post was removed from the queue, but its original Discord message could not be restored automatically. This can happen with posts staged before the latest update or if the original message was deleted.';
+    }
+
+    return res.status(200).json(
+      previewResponse
     );
   } finally {
     if (lockAcquired) {
@@ -1387,6 +1475,338 @@ function formatInstagramError(
     error.message ||
     'Unknown Instagram error.'
   );
+}
+
+
+/* ============================================================
+   CONFESSION RECOVERY / MODERATION MESSAGE HELPERS
+   ============================================================ */
+
+async function getOrRestoreConfession(
+  redis,
+  uniqueId,
+  interaction
+) {
+  const stored =
+    await redis.get(`conf_${uniqueId}`);
+
+  if (stored) {
+    try {
+      const confession = JSON.parse(stored);
+      if (typeof confession.text === 'string' && confession.text.trim()) {
+        return {
+          ...confession,
+          uniqueId,
+        };
+      }
+    } catch (error) {
+      console.warn(
+        '[Redis] Stored confession was invalid; attempting Discord recovery.',
+        error.message
+      );
+    }
+  }
+
+  const recovered =
+    recoverConfessionFromDiscordMessage(
+      interaction?.message
+    );
+
+  if (!recovered) {
+    return null;
+  }
+
+  let imageUrl = recovered.imageUrl;
+
+  try {
+    imageUrl =
+      createConfessionImageUrl(
+        recovered.text
+      ).imageUrl || imageUrl;
+  } catch (error) {
+    console.warn(
+      '[Cloudinary] Could not regenerate recovered confession image; retaining the existing embed URL:',
+      error.message
+    );
+  }
+
+  const confession = {
+    text: recovered.text,
+    imageUrl,
+    uniqueId,
+  };
+
+  await redis.set(
+    `conf_${uniqueId}`,
+    JSON.stringify(confession),
+    'EX',
+    CONFESSION_TTL_SECONDS
+  );
+
+  console.log(
+    '[Moderation] Recovered expired confession from its Discord message.',
+    { uniqueId }
+  );
+
+  return confession;
+}
+
+function recoverConfessionFromDiscordMessage(
+  message
+) {
+  const content = message?.content;
+
+  if (typeof content !== 'string') {
+    return null;
+  }
+
+  const headerEnd = content.indexOf('\n');
+  if (headerEnd === -1) {
+    return null;
+  }
+
+  const header = content.slice(0, headerEnd);
+  if (!header.startsWith('🟡 **New Confession**')) {
+    return null;
+  }
+
+  let text = content.slice(headerEnd + 1);
+  if (!text.startsWith('>')) {
+    return null;
+  }
+
+  // The original webhook adds one quote marker and one separator space.
+  // Remove only those characters, preserving the sender's actual text.
+  text = text.startsWith('> ')
+    ? text.slice(2)
+    : text.slice(1);
+
+  if (!text.trim()) {
+    return null;
+  }
+
+  const imageUrl =
+    message.embeds?.find(
+      (embed) => embed.image?.url
+    )?.image?.url || null;
+
+  return { text, imageUrl };
+}
+
+function createModerationMessagePayload(
+  uniqueId,
+  confession
+) {
+  let imageUrl = confession.imageUrl;
+
+  try {
+    imageUrl =
+      createConfessionImageUrl(
+        confession.text
+      ).imageUrl || imageUrl;
+  } catch (error) {
+    console.warn(
+      '[Cloudinary] Could not regenerate image while restoring moderation message:',
+      error.message
+    );
+  }
+
+  return {
+    content:
+      `🟡 **New Confession** <@${MODERATOR_USER_ID}>\n> ${confession.text}`,
+
+    embeds: imageUrl
+      ? [{ image: { url: imageUrl } }]
+      : [],
+
+    components: [
+      {
+        type: 1,
+        components: [
+          {
+            type: 2,
+            style: 1,
+            label: 'Stage',
+            custom_id: `stage_${uniqueId}`,
+          },
+          {
+            type: 2,
+            style: 3,
+            label: 'Post Now',
+            custom_id: `post_${uniqueId}`,
+          },
+          {
+            type: 2,
+            style: 4,
+            label: 'Delete',
+            custom_id: `delete_${uniqueId}`,
+          },
+        ],
+      },
+    ],
+    allowed_mentions: { parse: [] },
+  };
+}
+
+async function restoreModerationPostAfterUnstage(
+  redis,
+  stagedPost
+) {
+  const channelId = stagedPost.discordChannelId;
+  const messageId = stagedPost.discordMessageId;
+
+  // Queue entries created before this update have no source-message metadata.
+  // Leave those entries unstaged but do not invent an inaccessible control ID.
+  if (!channelId || !messageId) {
+    console.warn(
+      '[Moderation] Cannot restore original message for a legacy staged item without Discord message metadata.'
+    );
+    return false;
+  }
+
+  const uniqueId =
+    typeof stagedPost.uniqueId === 'string' && stagedPost.uniqueId
+      ? stagedPost.uniqueId
+      : randomUUID();
+
+  const confession = {
+    text: stagedPost.text,
+    imageUrl: stagedPost.imageUrl || null,
+    uniqueId,
+  };
+
+  // Recreate a short-lived cache entry. If it expires again, the Discord
+  // moderation message remains the durable recovery copy.
+  try {
+    confession.imageUrl =
+      createConfessionImageUrl(
+        confession.text
+      ).imageUrl || confession.imageUrl;
+  } catch (error) {
+    console.warn(
+      '[Cloudinary] Could not regenerate image while unstaging:',
+      error.message
+    );
+  }
+
+  await redis.set(
+    `conf_${uniqueId}`,
+    JSON.stringify(confession),
+    'EX',
+    CONFESSION_TTL_SECONDS
+  );
+
+  try {
+    await editDiscordChannelMessage(
+      channelId,
+      messageId,
+      createModerationMessagePayload(
+        uniqueId,
+        confession
+      )
+    );
+  } catch (error) {
+    console.error(
+      '[Moderation] Failed to restore the original message after unstage:',
+      error
+    );
+    throw error;
+  }
+
+  return true;
+}
+
+async function deletePublishedSourceMessages(
+  stagedPosts
+) {
+  for (const post of stagedPosts) {
+    if (!post.discordChannelId || !post.discordMessageId) {
+      continue;
+    }
+
+    try {
+      await deleteDiscordChannelMessage(
+        post.discordChannelId,
+        post.discordMessageId
+      );
+    } catch (error) {
+      // Publishing already succeeded and the queue has been cleared. A source
+      // message cleanup failure must not make the post appear un-published.
+      console.warn(
+        '[Moderation] Could not remove a published source message:',
+        error.message
+      );
+    }
+  }
+}
+
+async function sendInteractionFollowup(
+  interaction,
+  content
+) {
+  const appId =
+    process.env.DISCORD_APP_ID;
+
+  if (!appId || !interaction?.token) {
+    throw new Error(
+      'DISCORD_APP_ID or interaction token is missing.'
+    );
+  }
+
+  const response =
+    await fetch(
+      `https://discord.com/api/v10/webhooks/${appId}/${interaction.token}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          content,
+          flags: 64,
+          allowed_mentions: { parse: [] },
+        }),
+      }
+    );
+
+  if (!response.ok) {
+    const responseText = await response.text();
+    throw new Error(
+      `Discord interaction follow-up failed (${response.status}): ${responseText}`
+    );
+  }
+}
+
+async function deleteDiscordChannelMessage(
+  channelId,
+  messageId
+) {
+  const botToken =
+    process.env.DISCORD_BOT_TOKEN;
+
+  if (!botToken) {
+    throw new Error(
+      'DISCORD_BOT_TOKEN is not configured.'
+    );
+  }
+
+  const response =
+    await fetch(
+      `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
+      {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bot ${botToken}`,
+        },
+      }
+    );
+
+  if (!response.ok && response.status !== 404) {
+    const responseText = await response.text();
+    throw new Error(
+      `Discord channel message delete failed (${response.status}): ${responseText}`
+    );
+  }
 }
 
 
