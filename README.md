@@ -26,7 +26,7 @@ A lightweight, serverless moderation and publishing workflow for the University 
 5. **Archive**
    - A successful post is copied to the Discord channel in `DISCORD_ARCHIVE_ID` with a green embed. A deleted confession is copied with a red embed.
    - The archive copy is created before the source message is removed. If archive creation fails, a deleted confession remains recoverable and can be retried; a published confession is marked green as archive-pending and gets a Retry Archive button.
-   - Staged records stay in Redis only when an older queue item has no source Discord message and its archive copy fails. For current items, an archive failure leaves a Retry Archive button on the source and clears the published queue. The saved publish fingerprint prevents cleanup retries from repeating Instagram publication.
+   - Staged records stay in Redis only when an archive failure has no source-message Retry Archive button (for example, a legacy item has no source ID or Discord could not update its source message). Otherwise the source gets a retry button and the published queue is cleared. The saved publish fingerprint prevents cleanup retries from repeating Instagram publication.
    - `discord_archived_<uuid>` stores only the Discord archive message ID for seven days to prevent duplicate archive copies. The confession itself is not retained in Redis after successful archival/deletion cleanup.
 
 ## Runtime and storage

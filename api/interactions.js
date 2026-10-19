@@ -1206,7 +1206,7 @@ async function processStagedPublish(
           stagedPosts
         );
 
-      if (archiveResult.unresolvedLegacyFailures === 0) {
+      if (archiveResult.queueRetentionFailures === 0) {
         await redis.del(STAGED_POSTS_KEY);
       }
 
@@ -1215,9 +1215,9 @@ async function processStagedPublish(
         {
           content: archiveResult.archiveFailures === 0
             ? `Already published. Archive copies completed and Redis queue cleanup finished for ${stagedPosts.length} staged ${stagedPosts.length === 1 ? 'post' : 'posts'}.`
-            : archiveResult.unresolvedLegacyFailures === 0
+            : archiveResult.queueRetentionFailures === 0
               ? `Already published. ${archiveResult.archiveFailures} archive retry button(s) remain on the moderation messages; the Redis queue was cleared. No Instagram post will be repeated.`
-              : `Already published. ${archiveResult.unresolvedLegacyFailures} legacy confession(s) without a source message remain in the queue for archive retry. No Instagram post will be repeated.`,
+              : `Already published. ${archiveResult.queueRetentionFailures} archive failure(s) remain in the queue because no source retry button could be created. No Instagram post will be repeated.`,
           embeds: [],
           components: [],
         }
@@ -1284,7 +1284,7 @@ async function processStagedPublish(
 
     // A source message has its own Retry Archive button. Keep queue records
     // only for legacy items without a Discord source to retry from.
-    if (archiveResult.unresolvedLegacyFailures === 0) {
+    if (archiveResult.queueRetentionFailures === 0) {
       await redis.del(STAGED_POSTS_KEY);
     }
 
@@ -1298,9 +1298,9 @@ async function processStagedPublish(
       {
         content: archiveResult.archiveFailures === 0
           ? `${publishSummary} Archive copies completed.`
-          : archiveResult.unresolvedLegacyFailures === 0
+          : archiveResult.queueRetentionFailures === 0
             ? `${publishSummary} ${archiveResult.archiveFailures} archive retry button(s) remain on the moderation messages; the Redis queue was cleared.`
-            : `${publishSummary} ${archiveResult.unresolvedLegacyFailures} legacy confession(s) without a source message remain in the queue for archive retry.`,
+            : `${publishSummary} ${archiveResult.queueRetentionFailures} archive failure(s) remain in the queue because no source retry button could be created.`,
         embeds: [],
         components: [],
       }
@@ -1986,7 +1986,7 @@ async function deletePublishedSourceMessages(
   stagedPosts
 ) {
   let archiveFailures = 0;
-  let unresolvedLegacyFailures = 0;
+  let queueRetentionFailures = 0;
 
   for (let index = 0; index < stagedPosts.length; index += 1) {
     const post = stagedPosts[index];
@@ -2016,10 +2016,7 @@ async function deletePublishedSourceMessages(
       archiveFailures += 1;
       const hasSourceMessage =
         Boolean(post.discordChannelId && post.discordMessageId);
-
-      if (!hasSourceMessage) {
-        unresolvedLegacyFailures += 1;
-      }
+      let retryButtonAdded = false;
 
       console.warn(
         '[Discord archive] Could not archive a published confession:',
@@ -2042,6 +2039,7 @@ async function deletePublishedSourceMessages(
               components: createArchiveRetryComponents(uniqueId),
             }
           );
+          retryButtonAdded = true;
         } catch (editError) {
           console.warn(
             '[Discord archive] Could not mark the published source message for follow-up:',
@@ -2049,12 +2047,16 @@ async function deletePublishedSourceMessages(
           );
         }
       }
+
+      if (!retryButtonAdded) {
+        queueRetentionFailures += 1;
+      }
     }
   }
 
   return {
     archiveFailures,
-    unresolvedLegacyFailures,
+    queueRetentionFailures,
   };
 }
 
