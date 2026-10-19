@@ -1,6 +1,7 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createRedis, closeRedis } from '../lib/redis.js';
 import { createConfessionImageUrl } from '../lib/cloudinary.js';
+import { createConfessionEmbed, CONFESSION_STATUS } from '../lib/discord.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -107,15 +108,18 @@ export default async function handler(req, res) {
 
         body: JSON.stringify({
           content:
-            `🟡 **New Confession** <@145224646868860928>\n> ${text}`,
+            '<@145224646868860928>',
 
           embeds: [
-            {
-              image: {
-                url: imageUrl,
-              },
-            },
+            createConfessionEmbed(
+              { text, imageUrl },
+              CONFESSION_STATUS.new
+            ),
           ],
+
+          allowed_mentions: {
+            users: ['145224646868860928'],
+          },
 
           components: [
             {

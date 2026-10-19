@@ -4,6 +4,7 @@ import getRawBody from 'raw-body';
 import { createHash, randomUUID } from 'node:crypto';
 import { publishInstagramPosts } from '../lib/instagram.js';
 import { createConfessionImageUrl } from '../lib/cloudinary.js';
+import { createConfessionEmbed, CONFESSION_STATUS } from '../lib/discord.js';
 import { waitUntil } from '@vercel/functions';
 
 export const config = {
@@ -23,6 +24,7 @@ const STAGED_PUBLISH_LOCK_KEY = 'staged_publish_lock';
 const STAGED_PUBLISH_LOCK_TTL_SECONDS = 300;
 const POST_NOW_LOCK_TTL_SECONDS = 300;
 const POST_NOW_PUBLISHED_TTL_SECONDS = 86400;
+const DISCORD_ARCHIVE_MARKER_TTL_SECONDS = 604800;
 const STAGED_LAST_PUBLISH_KEY = 'staged_last_publish';
 
 const INSTAGRAM_REQUIRED_HASHTAGS =
@@ -244,7 +246,8 @@ async function handleComponent(
   // Stage and Delete keep their existing immediate behaviour.
   if (
     customId.startsWith('delete_') ||
-    customId.startsWith('stage_')
+    customId.startsWith('stage_') ||
+    customId.startsWith('archive_')
   ) {
     return handleModerationButton(
       interaction,
@@ -329,7 +332,7 @@ function showCaptionModal(
     }
 
     modalId =
-      `instagram_caption_post_${uniqueId}`;
+      `instagram_caption_post_${uniqueId}_${interaction.channel_id || ''}_${interaction.message?.id || ''}`;
   } else {
     modalId =
       'instagram_caption_staged';
@@ -444,10 +447,16 @@ async function handleModalSubmit(
       'instagram_caption_post_'
     )
   ) {
-    const uniqueId =
-      modalId.slice(
-        'instagram_caption_post_'.length
-      );
+    const postNowParts =
+      modalId
+        .slice('instagram_caption_post_'.length)
+        .split('_');
+
+    const uniqueId = postNowParts[0];
+    const source = {
+      channelId: postNowParts[1] || null,
+      messageId: postNowParts[2] || null,
+    };
 
     if (!uniqueId) {
       return res.status(400).send(
@@ -459,7 +468,8 @@ async function handleModalSubmit(
       processPostNow(
         interaction,
         uniqueId,
-        instagramCaption
+        instagramCaption,
+        source
       )
     );
 
@@ -553,24 +563,109 @@ async function processModerationButton(
   try {
     redis = await createRedis();
     /*
+     * ARCHIVE RETRY
+     */
+    if (action === 'archive') {
+      const confession =
+        await getOrRestoreConfession(
+          redis,
+          uniqueId,
+          interaction
+        );
+
+      if (!confession) {
+        await sendInteractionFollowup(
+          interaction,
+          'This confession could not be recovered, so no archive retry was performed.'
+        );
+        return;
+      }
+
+      const archiveResult =
+        await archiveConfession(
+          redis,
+          confession,
+          CONFESSION_STATUS.published,
+          {
+            channelId: interaction.channel_id,
+            messageId: interaction.message?.id,
+          }
+        );
+
+      await redis.del(`conf_${uniqueId}`);
+      await sendInteractionFollowup(
+        interaction,
+        archiveResult.sourceDeleted
+          ? 'Archive copy completed and the moderation message was removed.'
+          : 'Archive copy exists, but the moderation message could not be removed.'
+      );
+      return;
+    }
+
+    /*
      * DELETE
      */
     if (action === 'delete') {
-      await redis.del(
-        `conf_${uniqueId}`
-      );
+      const lockKey =
+        `confession_archive_lock_${uniqueId}`;
+      const lockToken =
+        randomUUID();
+      const lockAcquired =
+        await redis.set(
+          lockKey,
+          lockToken,
+          'NX',
+          'EX',
+          60
+        ) === 'OK';
 
-      await editDiscordMessage(
-        interaction.token,
-        {
-          content:
-            '🔴 **Deleted and Archived.**',
+      if (!lockAcquired) {
+        await sendInteractionFollowup(
+          interaction,
+          'This confession is already being archived. Please wait before trying again.'
+        );
+        return;
+      }
 
-          embeds: [],
+      try {
+        const confession =
+          await getOrRestoreConfession(
+            redis,
+            uniqueId,
+            interaction
+          );
 
-          components: [],
+        if (!confession) {
+          await sendInteractionFollowup(
+            interaction,
+            'This confession could not be recovered, so it was not deleted.'
+          );
+          return;
         }
-      );
+
+        await archiveConfession(
+          redis,
+          confession,
+          CONFESSION_STATUS.deleted,
+          {
+            channelId: interaction.channel_id,
+            messageId: interaction.message?.id,
+          }
+        );
+
+        await redis.del(`conf_${uniqueId}`);
+
+        await sendInteractionFollowup(
+          interaction,
+          'Deleted and archived. The reference copy is in the archive channel.'
+        );
+      } finally {
+        await releaseRedisLock(
+          redis,
+          lockKey,
+          lockToken
+        );
+      }
 
       return;
     }
@@ -695,9 +790,16 @@ async function processModerationButton(
         await editDiscordMessage(
           interaction.token,
           {
-            content:
-              `🟡 **Staged.** (Current Queue: ${queueLength}/${MAX_STAGED_POSTS})`,
-
+            content: '',
+            embeds: [
+              createConfessionEmbed(
+                confession,
+                {
+                  ...CONFESSION_STATUS.staged,
+                  title: `Staged · ${queueLength}/${MAX_STAGED_POSTS}`,
+                }
+              ),
+            ],
             components: [],
           }
         );
@@ -743,7 +845,8 @@ async function processModerationButton(
 async function processPostNow(
   interaction,
   uniqueId,
-  instagramCaption
+  instagramCaption,
+  source = {}
 ) {
   console.log(
     '[Instagram] Processing Post Now with caption.'
@@ -761,6 +864,11 @@ async function processPostNow(
   const publishedKey =
     `post_now_published_${uniqueId}`;
 
+  const sourceChannelId =
+    source.channelId || interaction.channel_id;
+  const sourceMessageId =
+    source.messageId || interaction.message?.id;
+
   try {
     redis = await createRedis();
 
@@ -772,39 +880,15 @@ async function processPostNow(
         `conf_${uniqueId}`
       );
 
-      const alreadyPostedMessage =
-        '🟢 **Already posted to Instagram.**';
-
       await editDiscordMessage(
         interaction.token,
         {
-          content: alreadyPostedMessage,
+          content:
+            'This confession was already published. No second Instagram post was created.',
           embeds: [],
           components: [],
         }
       );
-
-      if (
-        interaction.channel_id &&
-        interaction.message?.id
-      ) {
-        try {
-          await editDiscordChannelMessage(
-            interaction.channel_id,
-            interaction.message.id,
-            {
-              content: alreadyPostedMessage,
-              embeds: [],
-              components: [],
-            }
-          );
-        } catch (discordError) {
-          console.error(
-            'Failed to archive the original moderation message after detecting an existing publish:',
-            discordError
-          );
-        }
-      }
 
       return;
     }
@@ -823,7 +907,7 @@ async function processPostNow(
         interaction.token,
         {
           content:
-            '⚠️ **This confession is already being published.** Please wait for that attempt to finish.',
+            'This confession is already being published. Please wait for that attempt to finish.',
           embeds: [],
           components: [],
         }
@@ -844,7 +928,7 @@ async function processPostNow(
         interaction.token,
         {
           content:
-            '⚠️ **Error:** This confession expired and could not be recovered from the original Discord message.',
+            'This confession expired and could not be recovered from its Discord moderation message.',
           embeds: [],
           components: [],
         }
@@ -861,8 +945,8 @@ async function processPostNow(
     await editDiscordMessage(
       interaction.token,
       {
-        content:
-          '⏳ **Publishing to Instagram...**',
+        content: 'Publishing to Instagram...',
+        embeds: [],
         components: [],
       }
     );
@@ -885,7 +969,8 @@ async function processPostNow(
         interaction.token,
         {
           content:
-            `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\nThe confession was kept so it can be retried.`,
+            `Instagram publish failed.\n${formatInstagramError(error)}\n\nThe confession was kept so it can be retried.`,
+          embeds: [],
           components: [],
         }
       );
@@ -910,7 +995,8 @@ async function processPostNow(
         interaction.token,
         {
           content:
-            '⚠️ **Instagram accepted the post, but its retry guard could not be saved.** Please check Instagram before trying again.',
+            'Instagram accepted the post, but its retry guard could not be saved. Please check Instagram before trying again.',
+          embeds: [],
           components: [],
         }
       );
@@ -929,39 +1015,67 @@ async function processPostNow(
       );
     }
 
-    const postedMessage =
-      '🟢 **Posted Live to Instagram.**';
-
-    await editDiscordMessage(
-      interaction.token,
-      {
-        content: postedMessage,
-        embeds: [],
-        components: [],
-      }
-    );
-
-    // Also disable the buttons on the original moderation message.
-    if (
-      interaction.channel_id &&
-      interaction.message?.id
-    ) {
-      try {
-        await editDiscordChannelMessage(
-          interaction.channel_id,
-          interaction.message.id,
+    try {
+      const archiveResult =
+        await archiveConfession(
+          redis,
+          confession,
+          CONFESSION_STATUS.published,
           {
-            content: postedMessage,
-            embeds: [],
-            components: [],
+            channelId: sourceChannelId,
+            messageId: sourceMessageId,
           }
         );
-      } catch (discordError) {
-        console.error(
-          'Failed to archive the original moderation message after Instagram publish:',
-          discordError
-        );
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content: archiveResult.sourceDeleted
+            ? 'Posted to Instagram and archived.'
+            : 'Posted to Instagram and archived. The original moderation message could not be removed.',
+          embeds: [],
+          components: [],
+        }
+      );
+    } catch (archiveError) {
+      console.error(
+        '[Discord archive] Instagram publish succeeded, but archiving failed:',
+        archiveError
+      );
+
+      if (sourceChannelId && sourceMessageId) {
+        try {
+          await editDiscordChannelMessage(
+            sourceChannelId,
+            sourceMessageId,
+            {
+              content: '',
+              embeds: [
+                createConfessionEmbed(
+                  confession,
+                  CONFESSION_STATUS.archivePending
+                ),
+              ],
+              components: createArchiveRetryComponents(uniqueId),
+            }
+          );
+        } catch (discordError) {
+          console.error(
+            '[Discord archive] Could not mark the source message for archive follow-up:',
+            discordError
+          );
+        }
       }
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            'Posted to Instagram, but Discord archiving failed. The confession remains in the moderation channel for manual recovery.',
+          embeds: [],
+          components: [],
+        }
+      );
     }
   } catch (error) {
     console.error(
@@ -974,7 +1088,8 @@ async function processPostNow(
         interaction.token,
         {
           content:
-            `🔴 **Action failed.**\n> ${formatInstagramError(error)}\n\nPlease try again in a moment.`,
+            `Action failed.\n${formatInstagramError(error)}\n\nPlease try again in a moment.`,
+          embeds: [],
           components: [],
         }
       );
@@ -1003,7 +1118,6 @@ async function processPostNow(
     closeRedis(redis);
   }
 }
-
 
 /* ============================================================
    PUBLISH STAGED POSTS
@@ -1077,8 +1191,7 @@ async function processStagedPublish(
      */
     const queueFingerprint =
       createStagedQueueFingerprint(
-        stagedPosts,
-        instagramCaption
+        stagedPosts
       );
 
     const lastPublished =
@@ -1087,23 +1200,25 @@ async function processStagedPublish(
       );
 
     if (lastPublished === queueFingerprint) {
-      await redis.del(
-        STAGED_POSTS_KEY
-      );
+      const archiveResult =
+        await deletePublishedSourceMessages(
+          redis,
+          stagedPosts
+        );
 
-      await deletePublishedSourceMessages(
-        stagedPosts
-      );
+      if (archiveResult.queueRetentionFailures === 0) {
+        await redis.del(STAGED_POSTS_KEY);
+      }
 
       await editDiscordMessage(
         interaction.token,
         {
-          content:
-            `🟢 **Already published.** Redis cleanup completed for ${stagedPosts.length} staged ` +
-            `${stagedPosts.length === 1 ? 'post' : 'posts'}.`,
-
+          content: archiveResult.archiveFailures === 0
+            ? `Already published. Archive copies completed and Redis queue cleanup finished for ${stagedPosts.length} staged ${stagedPosts.length === 1 ? 'post' : 'posts'}.`
+            : archiveResult.queueRetentionFailures === 0
+              ? `Already published. ${archiveResult.archiveFailures} archive retry button(s) remain on the moderation messages; the Redis queue was cleared. No Instagram post will be repeated.`
+              : `Already published. ${archiveResult.queueRetentionFailures} archive failure(s) remain in the queue because no source retry button could be created. No Instagram post will be repeated.`,
           embeds: [],
-
           components: [],
         }
       );
@@ -1161,30 +1276,32 @@ async function processStagedPublish(
       86400
     );
 
-    await redis.del(
-      STAGED_POSTS_KEY
-    );
+    const archiveResult =
+      await deletePublishedSourceMessages(
+        redis,
+        stagedPosts
+      );
 
-    // These source messages no longer represent pending submissions. Remove
-    // them after a confirmed publish so the moderation channel stays focused
-    // on confessions that still need action.
-    await deletePublishedSourceMessages(
-      stagedPosts
-    );
+    // A source message has its own Retry Archive button. Keep queue records
+    // only for legacy items without a Discord source to retry from.
+    if (archiveResult.queueRetentionFailures === 0) {
+      await redis.del(STAGED_POSTS_KEY);
+    }
 
     const publishSummary =
       publishResult.type === 'carousel'
-        ? `🟢 **Published ${publishResult.count} staged confessions as 1 Instagram carousel.**`
-        : '🟢 **Published 1 staged confession to Instagram.**';
+        ? `Published ${publishResult.count} staged confessions as one Instagram carousel.`
+        : 'Published one staged confession to Instagram.';
 
     await editDiscordMessage(
       interaction.token,
       {
-        content:
-          publishSummary,
-
+        content: archiveResult.archiveFailures === 0
+          ? `${publishSummary} Archive copies completed.`
+          : archiveResult.queueRetentionFailures === 0
+            ? `${publishSummary} ${archiveResult.archiveFailures} archive retry button(s) remain on the moderation messages; the Redis queue was cleared.`
+            : `${publishSummary} ${archiveResult.queueRetentionFailures} archive failure(s) remain in the queue because no source retry button could be created.`,
         embeds: [],
-
         components: [],
       }
     );
@@ -1583,8 +1700,7 @@ async function releaseRedisLock(
 }
 
 function createStagedQueueFingerprint(
-  stagedPosts,
-  instagramCaption
+  stagedPosts
 ) {
   return createHash(
     'sha256'
@@ -1592,7 +1708,6 @@ function createStagedQueueFingerprint(
     .update(
       JSON.stringify({
         stagedPosts,
-        instagramCaption,
       })
     )
     .digest('hex');
@@ -1688,8 +1803,22 @@ async function getOrRestoreConfession(
 function recoverConfessionFromDiscordMessage(
   message
 ) {
-  const content = message?.content;
+  const embed =
+    message?.embeds?.find(
+      (candidate) =>
+        typeof candidate.description === 'string' &&
+        candidate.description.trim()
+    );
 
+  if (embed) {
+    return {
+      text: embed.description,
+      imageUrl: embed.image?.url || null,
+    };
+  }
+
+  // Support moderation messages created before confession text moved into embeds.
+  const content = message?.content;
   if (typeof content !== 'string') {
     return null;
   }
@@ -1709,22 +1838,19 @@ function recoverConfessionFromDiscordMessage(
     return null;
   }
 
-  // The original webhook adds one quote marker and one separator space.
-  // Remove only those characters, preserving the sender's actual text.
   text = text.startsWith('> ')
     ? text.slice(2)
     : text.slice(1);
 
-  if (!text.trim()) {
-    return null;
-  }
-
-  const imageUrl =
-    message.embeds?.find(
-      (embed) => embed.image?.url
-    )?.image?.url || null;
-
-  return { text, imageUrl };
+  return text.trim()
+    ? {
+        text,
+        imageUrl:
+          message.embeds?.find(
+            (candidate) => candidate.image?.url
+          )?.image?.url || null,
+      }
+    : null;
 }
 
 function createModerationMessagePayload(
@@ -1747,11 +1873,14 @@ function createModerationMessagePayload(
 
   return {
     content:
-      `🟡 **New Confession** <@${MODERATOR_USER_ID}>\n> ${confession.text}`,
+      `<@${MODERATOR_USER_ID}>`,
 
-    embeds: imageUrl
-      ? [{ image: { url: imageUrl } }]
-      : [],
+    embeds: [
+      createConfessionEmbed(
+        { ...confession, imageUrl },
+        CONFESSION_STATUS.new
+      ),
+    ],
 
     components: [
       {
@@ -1778,7 +1907,9 @@ function createModerationMessagePayload(
         ],
       },
     ],
-    allowed_mentions: { parse: [] },
+    allowed_mentions: {
+      users: [MODERATOR_USER_ID],
+    },
   };
 }
 
@@ -1851,27 +1982,247 @@ async function restoreModerationPostAfterUnstage(
 }
 
 async function deletePublishedSourceMessages(
+  redis,
   stagedPosts
 ) {
-  for (const post of stagedPosts) {
-    if (!post.discordChannelId || !post.discordMessageId) {
-      continue;
-    }
+  let archiveFailures = 0;
+  let queueRetentionFailures = 0;
+
+  for (let index = 0; index < stagedPosts.length; index += 1) {
+    const post = stagedPosts[index];
+    const uniqueId =
+      typeof post.uniqueId === 'string' && post.uniqueId
+        ? post.uniqueId
+        : `legacy-${createHash('sha256')
+            .update(JSON.stringify({
+              text: post.text,
+              imageUrl: post.imageUrl || null,
+              index,
+            }))
+            .digest('hex')
+            .slice(0, 24)}`;
 
     try {
-      await deleteDiscordChannelMessage(
-        post.discordChannelId,
-        post.discordMessageId
+      await archiveConfession(
+        redis,
+        { ...post, uniqueId },
+        CONFESSION_STATUS.published,
+        {
+          channelId: post.discordChannelId,
+          messageId: post.discordMessageId,
+        }
       );
     } catch (error) {
-      // Publishing already succeeded and the queue has been cleared. A source
-      // message cleanup failure must not make the post appear un-published.
+      archiveFailures += 1;
+      const hasSourceMessage =
+        Boolean(post.discordChannelId && post.discordMessageId);
+      let retryButtonAdded = false;
+
       console.warn(
-        '[Moderation] Could not remove a published source message:',
+        '[Discord archive] Could not archive a published confession:',
+        error.message
+      );
+
+      if (hasSourceMessage) {
+        try {
+          await editDiscordChannelMessage(
+            post.discordChannelId,
+            post.discordMessageId,
+            {
+              content: '',
+              embeds: [
+                createConfessionEmbed(
+                  post,
+                  CONFESSION_STATUS.archivePending
+                ),
+              ],
+              components: createArchiveRetryComponents(uniqueId),
+            }
+          );
+          retryButtonAdded = true;
+        } catch (editError) {
+          console.warn(
+            '[Discord archive] Could not mark the published source message for follow-up:',
+            editError.message
+          );
+        }
+      }
+
+      if (!retryButtonAdded) {
+        queueRetentionFailures += 1;
+      }
+    }
+  }
+
+  return {
+    archiveFailures,
+    queueRetentionFailures,
+  };
+}
+
+function createArchiveRetryComponents(uniqueId) {
+  return [
+    {
+      type: 1,
+      components: [
+        {
+          type: 2,
+          style: 1,
+          label: 'Retry Archive',
+          custom_id: `archive_${uniqueId}`,
+        },
+      ],
+    },
+  ];
+}
+
+async function archiveConfession(
+  redis,
+  confession,
+  status,
+  source = {}
+) {
+  const archiveChannelId =
+    process.env.DISCORD_ARCHIVE_ID?.trim();
+
+  if (!archiveChannelId) {
+    throw new Error(
+      'DISCORD_ARCHIVE_ID is not configured.'
+    );
+  }
+
+  if (
+    typeof confession?.text !== 'string' ||
+    !confession.text.trim()
+  ) {
+    throw new Error(
+      'The confession text is unavailable; no archive copy was created.'
+    );
+  }
+
+  const uniqueId =
+    typeof confession.uniqueId === 'string' && confession.uniqueId
+      ? confession.uniqueId
+      : createHash('sha256')
+          .update(JSON.stringify(confession))
+          .digest('hex')
+          .slice(0, 24);
+
+  const markerKey =
+    `discord_archived_${uniqueId}`;
+
+  let archiveMessageId =
+    await redis.get(markerKey);
+
+  if (!archiveMessageId) {
+    if (!process.env.DISCORD_BOT_TOKEN) {
+      throw new Error(
+        'DISCORD_BOT_TOKEN is not configured.'
+      );
+    }
+
+    const nonce =
+      `archive-${createHash('sha256')
+        .update(uniqueId)
+        .digest('hex')
+        .slice(0, 16)}`;
+
+    const response = await fetch(
+      `https://discord.com/api/v10/channels/${archiveChannelId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization:
+            `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+        },
+        body: JSON.stringify({
+          embeds: [
+            createConfessionEmbed(
+              confession,
+              status
+            ),
+          ],
+          allowed_mentions: { parse: [] },
+          nonce,
+          enforce_nonce: true,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const responseText = await response.text();
+      throw new Error(
+        `Discord archive message failed (${response.status}): ${responseText}`
+      );
+    }
+
+    const archivedMessage =
+      await response.json();
+    archiveMessageId =
+      archivedMessage.id || 'created';
+
+    try {
+      await redis.set(
+        markerKey,
+        archiveMessageId,
+        'EX',
+        DISCORD_ARCHIVE_MARKER_TTL_SECONDS
+      );
+    } catch (error) {
+      // The Discord nonce still protects a short retry window if Redis is
+      // temporarily unavailable after the archive message was created.
+      console.warn(
+        '[Discord archive] Could not store the temporary idempotency marker:',
         error.message
       );
     }
   }
+
+  let sourceDeleted = true;
+
+  if (source.channelId && source.messageId) {
+    try {
+      await deleteDiscordChannelMessage(
+        source.channelId,
+        source.messageId
+      );
+    } catch (error) {
+      sourceDeleted = false;
+      console.warn(
+        '[Discord archive] Archive copy exists, but the source message could not be removed:',
+        error.message
+      );
+
+      try {
+        await editDiscordChannelMessage(
+          source.channelId,
+          source.messageId,
+          {
+            content: '',
+            embeds: [
+              createConfessionEmbed(
+                confession,
+                status
+              ),
+            ],
+            components: [],
+          }
+        );
+      } catch (editError) {
+        console.warn(
+          '[Discord archive] Could not disable the source message:',
+          editError.message
+        );
+      }
+    }
+  }
+
+  return {
+    archived: true,
+    archiveMessageId,
+    sourceDeleted,
+  };
 }
 
 async function sendInteractionFollowup(
