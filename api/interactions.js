@@ -1200,22 +1200,24 @@ async function processStagedPublish(
       );
 
     if (lastPublished === queueFingerprint) {
-      const archiveFailures =
+      const archiveResult =
         await deletePublishedSourceMessages(
           redis,
           stagedPosts
         );
 
-      if (archiveFailures === 0) {
+      if (archiveResult.unresolvedLegacyFailures === 0) {
         await redis.del(STAGED_POSTS_KEY);
       }
 
       await editDiscordMessage(
         interaction.token,
         {
-          content: archiveFailures === 0
+          content: archiveResult.archiveFailures === 0
             ? `Already published. Archive copies completed and Redis queue cleanup finished for ${stagedPosts.length} staged ${stagedPosts.length === 1 ? 'post' : 'posts'}.`
-            : `Already published. ${archiveFailures} confession(s) could not be archived; the queue is retained. Retry this action after resolving the Discord archive issue. No Instagram post will be repeated.`,
+            : archiveResult.unresolvedLegacyFailures === 0
+              ? `Already published. ${archiveResult.archiveFailures} archive retry button(s) remain on the moderation messages; the Redis queue was cleared. No Instagram post will be repeated.`
+              : `Already published. ${archiveResult.unresolvedLegacyFailures} legacy confession(s) without a source message remain in the queue for archive retry. No Instagram post will be repeated.`,
           embeds: [],
           components: [],
         }
@@ -1274,15 +1276,15 @@ async function processStagedPublish(
       86400
     );
 
-    const archiveFailures =
+    const archiveResult =
       await deletePublishedSourceMessages(
         redis,
         stagedPosts
       );
 
-    // Keep the published queue if an archive copy failed. The fingerprint
-    // above prevents a later retry from publishing the same content again.
-    if (archiveFailures === 0) {
+    // A source message has its own Retry Archive button. Keep queue records
+    // only for legacy items without a Discord source to retry from.
+    if (archiveResult.unresolvedLegacyFailures === 0) {
       await redis.del(STAGED_POSTS_KEY);
     }
 
@@ -1294,9 +1296,11 @@ async function processStagedPublish(
     await editDiscordMessage(
       interaction.token,
       {
-        content: archiveFailures === 0
+        content: archiveResult.archiveFailures === 0
           ? `${publishSummary} Archive copies completed.`
-          : `${publishSummary} ${archiveFailures} confession(s) could not be archived, so the queue is retained for cleanup. Retrying will not repeat the Instagram post.`,
+          : archiveResult.unresolvedLegacyFailures === 0
+            ? `${publishSummary} ${archiveResult.archiveFailures} archive retry button(s) remain on the moderation messages; the Redis queue was cleared.`
+            : `${publishSummary} ${archiveResult.unresolvedLegacyFailures} legacy confession(s) without a source message remain in the queue for archive retry.`,
         embeds: [],
         components: [],
       }
@@ -1982,6 +1986,7 @@ async function deletePublishedSourceMessages(
   stagedPosts
 ) {
   let archiveFailures = 0;
+  let unresolvedLegacyFailures = 0;
 
   for (let index = 0; index < stagedPosts.length; index += 1) {
     const post = stagedPosts[index];
@@ -2009,12 +2014,19 @@ async function deletePublishedSourceMessages(
       );
     } catch (error) {
       archiveFailures += 1;
+      const hasSourceMessage =
+        Boolean(post.discordChannelId && post.discordMessageId);
+
+      if (!hasSourceMessage) {
+        unresolvedLegacyFailures += 1;
+      }
+
       console.warn(
         '[Discord archive] Could not archive a published confession:',
         error.message
       );
 
-      if (post.discordChannelId && post.discordMessageId) {
+      if (hasSourceMessage) {
         try {
           await editDiscordChannelMessage(
             post.discordChannelId,
@@ -2040,7 +2052,10 @@ async function deletePublishedSourceMessages(
     }
   }
 
-  return archiveFailures;
+  return {
+    archiveFailures,
+    unresolvedLegacyFailures,
+  };
 }
 
 function createArchiveRetryComponents(uniqueId) {
