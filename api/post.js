@@ -1,3 +1,4 @@
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createRedis, closeRedis } from '../lib/redis.js';
 import { createConfessionImageUrl } from '../lib/cloudinary.js';
 
@@ -12,9 +13,43 @@ export default async function handler(req, res) {
 
   try {
     const tallyData = req.body;
-    const text = tallyData?.data?.fields?.[0]?.value;
+    const signingSecret =
+      process.env.TALLY_WEBHOOK_SECRET;
+    const signature =
+      req.headers['tally-signature'];
 
-    if (!text) {
+    if (!signingSecret) {
+      console.error(
+        'Tally webhook rejected: TALLY_WEBHOOK_SECRET is not configured.'
+      );
+
+      return res.status(503).json({
+        success: false,
+        error: 'Webhook signing is not configured.',
+      });
+    }
+
+    if (
+      !verifyTallySignature(
+        tallyData,
+        signature,
+        signingSecret
+      )
+    ) {
+      console.warn(
+        'Tally webhook rejected: invalid signature.'
+      );
+
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid webhook signature.',
+      });
+    }
+
+    const text =
+      tallyData?.data?.fields?.[0]?.value;
+
+    if (typeof text !== 'string' || !text.trim()) {
       return res.status(200).json({
         message:
           'Webhook received, but no confession text found (likely a test ping).',
@@ -37,7 +72,7 @@ export default async function handler(req, res) {
     );
 
     // Generate a unique ID for this confession.
-    const uniqueId = crypto.randomUUID();
+    const uniqueId = randomUUID();
 
     // Store confession data in Redis for 24 hours.
     await redis.set(
@@ -143,4 +178,29 @@ export default async function handler(req, res) {
   } finally {
     closeRedis(redis);
   }
+}
+
+function verifyTallySignature(payload, signature, signingSecret) {
+  if (
+    !payload ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload) ||
+    typeof signature !== 'string' ||
+    !signature
+  ) {
+    return false;
+  }
+
+  const expectedSignature =
+    createHmac('sha256', signingSecret)
+      .update(JSON.stringify(payload))
+      .digest();
+
+  const receivedSignature =
+    Buffer.from(signature, 'base64');
+
+  return (
+    receivedSignature.length === expectedSignature.length &&
+    timingSafeEqual(receivedSignature, expectedSignature)
+  );
 }

@@ -21,6 +21,8 @@ const MODERATOR_USER_ID = '145224646868860928';
 const STAGED_POSTS_KEY = 'staged_posts';
 const STAGED_PUBLISH_LOCK_KEY = 'staged_publish_lock';
 const STAGED_PUBLISH_LOCK_TTL_SECONDS = 300;
+const POST_NOW_LOCK_TTL_SECONDS = 300;
+const POST_NOW_PUBLISHED_TTL_SECONDS = 86400;
 const STAGED_LAST_PUBLISH_KEY = 'staged_last_publish';
 
 const INSTAGRAM_REQUIRED_HASHTAGS =
@@ -748,11 +750,89 @@ async function processPostNow(
   );
 
   let redis;
+  let lockAcquired = false;
+
+  const lockToken =
+    randomUUID();
+
+  const lockKey =
+    `post_now_lock_${uniqueId}`;
+
+  const publishedKey =
+    `post_now_published_${uniqueId}`;
 
   try {
     redis = await createRedis();
 
-    let confession =
+    const publishedMediaId =
+      await redis.get(publishedKey);
+
+    if (publishedMediaId) {
+      await redis.del(
+        `conf_${uniqueId}`
+      );
+
+      const alreadyPostedMessage =
+        '🟢 **Already posted to Instagram.**';
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content: alreadyPostedMessage,
+          embeds: [],
+          components: [],
+        }
+      );
+
+      if (
+        interaction.channel_id &&
+        interaction.message?.id
+      ) {
+        try {
+          await editDiscordChannelMessage(
+            interaction.channel_id,
+            interaction.message.id,
+            {
+              content: alreadyPostedMessage,
+              embeds: [],
+              components: [],
+            }
+          );
+        } catch (discordError) {
+          console.error(
+            'Failed to archive the original moderation message after detecting an existing publish:',
+            discordError
+          );
+        }
+      }
+
+      return;
+    }
+
+    lockAcquired =
+      await redis.set(
+        lockKey,
+        lockToken,
+        'NX',
+        'EX',
+        POST_NOW_LOCK_TTL_SECONDS
+      ) === 'OK';
+
+    if (!lockAcquired) {
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '⚠️ **This confession is already being published.** Please wait for that attempt to finish.',
+          embeds: [],
+          components: [],
+        }
+      );
+
+      return;
+    }
+
+    const confession =
       await getOrRestoreConfession(
         redis,
         uniqueId,
@@ -765,9 +845,7 @@ async function processPostNow(
         {
           content:
             '⚠️ **Error:** This confession expired and could not be recovered from the original Discord message.',
-
           embeds: [],
-
           components: [],
         }
       );
@@ -776,7 +854,7 @@ async function processPostNow(
     }
 
     // Regenerate the preview URL so pending submissions created before this
-    // deployment also use the current Background v2 design when published.
+    // deployment also use the current rendering design when published.
     confession.imageUrl =
       createConfessionImageUrl(confession.text).imageUrl;
 
@@ -785,59 +863,18 @@ async function processPostNow(
       {
         content:
           '⏳ **Publishing to Instagram...**',
-
         components: [],
       }
     );
 
+    let publishResult;
+
     try {
-      await publishInstagramPosts(
-        [confession],
-        instagramCaption
-      );
-
-      // Only clear the temporary confession after a confirmed publish.
-      await redis.del(
-        `conf_${uniqueId}`
-      );
-
-      await editDiscordMessage(
-        interaction.token,
-        {
-          content:
-            '🟢 **Posted Live to Instagram.**',
-
-          embeds: [],
-
-          components: [],
-        }
-      );
-
-      // Also disable the buttons on the original moderation message.
-      if (
-        interaction.channel_id &&
-        interaction.message?.id
-      ) {
-        try {
-          await editDiscordChannelMessage(
-            interaction.channel_id,
-            interaction.message.id,
-            {
-              content:
-                '🟢 **Posted Live to Instagram.**',
-
-              embeds: [],
-
-              components: [],
-            }
-          );
-        } catch (discordError) {
-          console.error(
-            'Failed to archive the original moderation message after Instagram publish:',
-            discordError
-          );
-        }
-      }
+      publishResult =
+        await publishInstagramPosts(
+          [confession],
+          instagramCaption
+        );
     } catch (error) {
       console.error(
         'Instagram Post Now failed:',
@@ -848,12 +885,83 @@ async function processPostNow(
         interaction.token,
         {
           content:
-            `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\n` +
-            'The confession was kept so it can be retried.',
-
+            `🔴 **Instagram publish failed.**\n> ${formatInstagramError(error)}\n\nThe confession was kept so it can be retried.`,
           components: [],
         }
       );
+
+      return;
+    }
+
+    try {
+      await redis.set(
+        publishedKey,
+        publishResult.mediaId || 'published',
+        'EX',
+        POST_NOW_PUBLISHED_TTL_SECONDS
+      );
+    } catch (error) {
+      console.error(
+        'Instagram accepted Post Now, but the duplicate guard could not be saved:',
+        error
+      );
+
+      await editDiscordMessage(
+        interaction.token,
+        {
+          content:
+            '⚠️ **Instagram accepted the post, but its retry guard could not be saved.** Please check Instagram before trying again.',
+          components: [],
+        }
+      );
+
+      return;
+    }
+
+    try {
+      await redis.del(
+        `conf_${uniqueId}`
+      );
+    } catch (error) {
+      console.warn(
+        'Instagram post succeeded, but the temporary confession record could not be cleared:',
+        error.message
+      );
+    }
+
+    const postedMessage =
+      '🟢 **Posted Live to Instagram.**';
+
+    await editDiscordMessage(
+      interaction.token,
+      {
+        content: postedMessage,
+        embeds: [],
+        components: [],
+      }
+    );
+
+    // Also disable the buttons on the original moderation message.
+    if (
+      interaction.channel_id &&
+      interaction.message?.id
+    ) {
+      try {
+        await editDiscordChannelMessage(
+          interaction.channel_id,
+          interaction.message.id,
+          {
+            content: postedMessage,
+            embeds: [],
+            components: [],
+          }
+        );
+      } catch (discordError) {
+        console.error(
+          'Failed to archive the original moderation message after Instagram publish:',
+          discordError
+        );
+      }
     }
   } catch (error) {
     console.error(
@@ -867,7 +975,6 @@ async function processPostNow(
         {
           content:
             `🔴 **Action failed.**\n> ${formatInstagramError(error)}\n\nPlease try again in a moment.`,
-
           components: [],
         }
       );
@@ -878,6 +985,21 @@ async function processPostNow(
       );
     }
   } finally {
+    if (redis && lockAcquired) {
+      try {
+        await releaseRedisLock(
+          redis,
+          lockKey,
+          lockToken
+        );
+      } catch (error) {
+        console.error(
+          'Failed to release the Post Now lock:',
+          error
+        );
+      }
+    }
+
     closeRedis(redis);
   }
 }
@@ -1434,6 +1556,18 @@ async function releaseStagedPublishLock(
   redis,
   lockToken
 ) {
+  await releaseRedisLock(
+    redis,
+    STAGED_PUBLISH_LOCK_KEY,
+    lockToken
+  );
+}
+
+async function releaseRedisLock(
+  redis,
+  lockKey,
+  lockToken
+) {
   await redis.eval(
     `
       if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -1443,7 +1577,7 @@ async function releaseStagedPublishLock(
       return 0
     `,
     1,
-    STAGED_PUBLISH_LOCK_KEY,
+    lockKey,
     lockToken
   );
 }
